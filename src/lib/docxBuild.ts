@@ -1,5 +1,6 @@
 import {
   Document, Packer, Paragraph, HeadingLevel, TextRun, ImageRun, AlignmentType,
+  Table, TableRow, TableCell, WidthType, BorderStyle,
 } from "docx";
 import { latexToOmml } from "./latexOmml";
 import type { DocPlan, DocBlock } from "./types";
@@ -36,9 +37,34 @@ async function imageDimensions(dataUrl: string): Promise<{ width: number; height
 
 interface FormulaMarker { id: string; latex: string; display: boolean; }
 
+/** Split a text run by $...$ (inline) and $$...$$ (display-inside-paragraph) markers and
+ *  emit TextRuns interleaved with formula-marker placeholders. */
+function runsWithMath(text: string, formulas: FormulaMarker[], opts: { bold?: boolean } = {}): TextRun[] {
+  const out: TextRun[] = [];
+  // Match $$...$$ first (greedy on inner), then $...$
+  const re = /\$\$([^$]+?)\$\$|\$([^$\n]+?)\$/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    if (m.index > last) {
+      const seg = text.slice(last, m.index);
+      if (seg) out.push(new TextRun({ text: seg, bold: opts.bold }));
+    }
+    const isDisplay = !!m[1];
+    const latex = (m[1] || m[2] || "").trim();
+    const id = `OMMLMARK_${formulas.length.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    formulas.push({ id, latex, display: isDisplay });
+    out.push(new TextRun({ text: id, font: "Cambria Math" }));
+    last = re.lastIndex;
+  }
+  if (last < text.length) out.push(new TextRun({ text: text.slice(last), bold: opts.bold }));
+  if (out.length === 0) out.push(new TextRun({ text, bold: opts.bold }));
+  return out;
+}
+
 export async function buildDocx(plan: DocPlan): Promise<Blob> {
   const formulaMarkers: FormulaMarker[] = [];
-  const children: Paragraph[] = [];
+  const children: (Paragraph | Table)[] = [];
 
   if (plan.title?.trim()) {
     children.push(new Paragraph({
@@ -49,7 +75,7 @@ export async function buildDocx(plan: DocPlan): Promise<Blob> {
   }
 
   for (const block of plan.blocks) {
-    children.push(...(await blockToParagraphs(block, formulaMarkers)));
+    children.push(...(await blockToElements(block, formulaMarkers)));
   }
 
   const doc = new Document({
@@ -66,21 +92,36 @@ export async function buildDocx(plan: DocPlan): Promise<Blob> {
   return injectOmmlIntoDocx(blob, formulaMarkers);
 }
 
-async function blockToParagraphs(block: DocBlock, formulas: FormulaMarker[]): Promise<Paragraph[]> {
+async function blockToElements(block: DocBlock, formulas: FormulaMarker[]): Promise<(Paragraph | Table)[]> {
   switch (block.type) {
+    case "table": {
+      const rows = block.rows.map((row, ri) => new TableRow({
+        children: row.map(cell => new TableCell({
+          children: [new Paragraph({
+            children: runsWithMath(cell, formulas, { bold: !!(block.header && ri === 0) }),
+          })],
+        })),
+      }));
+      const border = { style: BorderStyle.SINGLE, size: 4, color: "888888" };
+      return [new Table({
+        width: { size: 100, type: WidthType.PERCENTAGE },
+        rows,
+        borders: { top: border, bottom: border, left: border, right: border, insideHorizontal: border, insideVertical: border },
+      })];
+    }
     case "h1":
-      return [new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun({ text: block.text, bold: true })] })];
+      return [new Paragraph({ heading: HeadingLevel.HEADING_1, children: runsWithMath(block.text, formulas, { bold: true }) })];
     case "h2":
-      return [new Paragraph({ heading: HeadingLevel.HEADING_2, children: [new TextRun({ text: block.text, bold: true })] })];
+      return [new Paragraph({ heading: HeadingLevel.HEADING_2, children: runsWithMath(block.text, formulas, { bold: true }) })];
     case "h3":
-      return [new Paragraph({ heading: HeadingLevel.HEADING_3, children: [new TextRun({ text: block.text, bold: true })] })];
+      return [new Paragraph({ heading: HeadingLevel.HEADING_3, children: runsWithMath(block.text, formulas, { bold: true }) })];
     case "para":
-      return [new Paragraph({ children: [new TextRun(block.text)] })];
+      return [new Paragraph({ children: runsWithMath(block.text, formulas) })];
     case "list":
       return block.items.map((it) => new Paragraph({
         bullet: block.ordered ? undefined : { level: 0 },
         numbering: block.ordered ? { reference: "ordered", level: 0 } : undefined,
-        children: [new TextRun(it)],
+        children: runsWithMath(it, formulas),
       }));
     case "formula": {
       const id = `OMMLMARK_${formulas.length.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;

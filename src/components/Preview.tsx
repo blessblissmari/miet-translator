@@ -59,13 +59,13 @@ function SlideHTML({ slide, index }: { slide: SlidePlan; index: number }) {
     <div className={layoutClass}>
       <div className="slide-num">{index}</div>
       {slide.layout === "section-title" ? (
-        <div className="section-title">{slide.title}</div>
+        <div className="section-title"><InlineMath text={slide.title} /></div>
       ) : (
         <>
-          <div className="slide-title">{slide.title}</div>
+          <div className="slide-title"><InlineMath text={slide.title} /></div>
           <div className="slide-body">
             <div className="slide-bullets">
-              {slide.bullets.map((b, i) => <div key={i} className="bullet">• {b}</div>)}
+              {slide.bullets.map((b, i) => <div key={i} className="bullet">• <InlineMath text={b} /></div>)}
             </div>
             {slide.imageDataUrl && (
               <img src={slide.imageDataUrl} alt={`slide ${index}`} className="slide-img" />
@@ -75,6 +75,30 @@ function SlideHTML({ slide, index }: { slide: SlidePlan; index: number }) {
       )}
     </div>
   );
+}
+
+/** Render a string that may contain $...$ inline math and $$...$$ display math. */
+function InlineMath({ text }: { text: string }) {
+  const parts: Array<{ kind: "text" | "inline" | "display"; value: string }> = [];
+  const re = /\$\$([^$]+?)\$\$|\$([^$\n]+?)\$/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    if (m.index > last) parts.push({ kind: "text", value: text.slice(last, m.index) });
+    if (m[1]) parts.push({ kind: "display", value: m[1] });
+    else parts.push({ kind: "inline", value: m[2] });
+    last = re.lastIndex;
+  }
+  if (last < text.length) parts.push({ kind: "text", value: text.slice(last) });
+  if (parts.length === 0) return <>{text}</>;
+  return <>{parts.map((p, i) => {
+    if (p.kind === "text") return <span key={i}>{p.value}</span>;
+    let html: string;
+    try { html = temml.renderToString(p.value, { displayMode: p.kind === "display", throwOnError: false }); }
+    catch { html = `<code>${p.value}</code>`; }
+    const Tag = p.kind === "display" ? "div" : "span";
+    return <Tag key={i} className={p.kind === "display" ? "formula-display" : "formula-inline"} dangerouslySetInnerHTML={{ __html: html }} />;
+  })}</>;
 }
 
 /* ──────────────────────────────────────────────
@@ -91,13 +115,30 @@ export function DocPreview({ doc }: { doc: DocPlan }) {
 
 function DocBlockEl({ block }: { block: DocBlock }) {
   switch (block.type) {
-    case "h1": return <h1>{block.text}</h1>;
-    case "h2": return <h2>{block.text}</h2>;
-    case "h3": return <h3>{block.text}</h3>;
-    case "para": return <p>{block.text}</p>;
+    case "h1": return <h1><InlineMath text={block.text} /></h1>;
+    case "h2": return <h2><InlineMath text={block.text} /></h2>;
+    case "h3": return <h3><InlineMath text={block.text} /></h3>;
+    case "para": return <p><InlineMath text={block.text} /></p>;
     case "list": {
-      if (block.ordered) return <ol>{block.items.map((it, i) => <li key={i}>{it}</li>)}</ol>;
-      return <ul>{block.items.map((it, i) => <li key={i}>{it}</li>)}</ul>;
+      if (block.ordered) return <ol>{block.items.map((it, i) => <li key={i}><InlineMath text={it} /></li>)}</ol>;
+      return <ul>{block.items.map((it, i) => <li key={i}><InlineMath text={it} /></li>)}</ul>;
+    }
+    case "table": {
+      return (
+        <table className="doc-table">
+          <tbody>
+            {block.rows.map((row, ri) => (
+              <tr key={ri}>
+                {row.map((cell, ci) => {
+                  const isHeader = block.header && ri === 0;
+                  const Cell = (isHeader ? "th" : "td") as "th" | "td";
+                  return <Cell key={ci}><InlineMath text={cell} /></Cell>;
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      );
     }
     case "formula": {
       let html: string;

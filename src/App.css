@@ -276,3 +276,7 @@ select.q-kind.kind-document    { color: #a78bfa; border-color: #a78bfa; }
   font-family: ui-monospace, "SFMono-Regular", monospace; font-size: 12px;
   line-height: 1.5;
 }
+
+.doc-preview .doc-table { border-collapse: collapse; width: 100%; margin: 12px 0; background: white; }
+.doc-preview .doc-table th, .doc-preview .doc-table td { border: 1px solid #d0d0d0; padding: 6px 10px; color: #1a202c; font-size: 13px; vertical-align: top; }
+.doc-preview .doc-table th { background: #f1f5f9; font-weight: 600; }

@@ -182,29 +182,37 @@ function CardThumb({ item }: { item: DeckItem }) {
 
 function PdfThumb({ blob }: { blob: Blob }) {
   const ref = useRef<HTMLCanvasElement>(null);
+  const [err, setErr] = useState("");
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const pdfjsLib = await import("pdfjs-dist");
-      const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-      const buf = await blob.arrayBuffer();
-      const doc = await pdfjsLib.getDocument({ data: buf }).promise;
-      const page = await doc.getPage(1);
-      const viewport = page.getViewport({ scale: 1 });
-      const canvas = ref.current;
-      if (!canvas || cancelled) return;
-      const targetW = 360;
-      const scale = targetW / viewport.width;
-      const vp = page.getViewport({ scale });
-      canvas.width = vp.width; canvas.height = vp.height;
-      const ctx = canvas.getContext("2d")!;
-      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-      await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
-    })().catch(console.error);
+      try {
+        const pdfjsLib = await import("pdfjs-dist");
+        const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+        const buf = await blob.arrayBuffer();
+        const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+        const page = await doc.getPage(1);
+        const viewport = page.getViewport({ scale: 1 });
+        const canvas = ref.current;
+        if (!canvas || cancelled) return;
+        const targetW = 400;
+        const scale = targetW / viewport.width;
+        const vp = page.getViewport({ scale });
+        canvas.width = vp.width; canvas.height = vp.height;
+        canvas.style.width = "100%"; canvas.style.height = "auto";
+        const ctx = canvas.getContext("2d")!;
+        ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
+      } catch (e) {
+        setErr((e as Error).message || "render failed");
+      }
+    })();
     return () => { cancelled = true; };
   }, [blob]);
-  return <div className="card-thumb pdf"><canvas ref={ref} /></div>;
+  return <div className="card-thumb pdf">
+    {err ? <div className="badge">PDF</div> : <canvas ref={ref} />}
+  </div>;
 }
 
 function useObjectUrl(blob: Blob): string {
