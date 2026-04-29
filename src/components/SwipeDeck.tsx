@@ -203,7 +203,7 @@ function PdfThumb({ blob }: { blob: Blob }) {
         canvas.style.width = "100%"; canvas.style.height = "auto";
         const ctx = canvas.getContext("2d")!;
         ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-        await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
       } catch (e) {
         setErr((e as Error).message || "render failed");
       }

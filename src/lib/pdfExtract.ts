@@ -38,7 +38,7 @@ export async function extractPdf(
     const ctx = canvas.getContext("2d")!;
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport, canvas }).promise;
+    await page.render({ canvasContext: ctx, viewport }).promise;
     // Use JPEG with quality for sparse pages so the data URL stays under request limits
     const imageDataUrl = isSparse
       ? canvas.toDataURL("image/jpeg", 0.85)
@@ -120,22 +120,39 @@ async function extractImages(page: unknown, pageH: number): Promise<ExtractedIma
     else if (fn === RESTORE) { if (stack.length > 1) stack.pop(); }
     else if (fn === TRANSFORM) {
       stack[stack.length - 1] = mul(cur(), args as number[]);
-    } else if (fn === PAINT_IMG || fn === PAINT_IMG_INLINE) {
-      const name = args[0] as string;
+    } else if (fn === PAINT_IMG) {
+      // args[0] is a named XObject reference (string like "img_p4_1")
+      const name = args[0];
+      if (typeof name !== "string") continue; // not a named ref → skip
       const ctm = cur();
-      // CTM e/f is image origin in PDF space; image w in PDF space is sqrt(a^2+b^2), h is sqrt(c^2+d^2)
       const w = Math.hypot(ctm[0], ctm[1]);
       const h = Math.hypot(ctm[2], ctm[3]);
-      const yPdf = ctm[5]; // bottom y in PDF coords (origin lower-left). Image extends from yPdf to yPdf+h.
+      const yPdf = ctm[5];
       const yTop = pageH - (yPdf + h);
 
-      const obj = await getObj(p, name);
+      let obj: unknown = null;
+      try { obj = await getObj(p, name); } catch { continue; }
       if (!obj) continue;
-      const dataUrl = await imageObjectToDataUrl(obj);
-      if (!dataUrl) continue;
-      // Filter tiny artefacts (<24 px)
       const oo = obj as { width?: number; height?: number };
       if ((oo.width ?? 0) < 24 || (oo.height ?? 0) < 24) continue;
+      let dataUrl: string | null = null;
+      try { dataUrl = await imageObjectToDataUrl(obj); } catch { continue; }
+      if (!dataUrl) continue;
+      out.push({ dataUrl, y: yTop, w, h });
+    } else if (fn === PAINT_IMG_INLINE) {
+      // Inline image: args[0] is the image data directly (not a name ref).
+      const img = args[0];
+      if (!img || typeof img !== "object") continue;
+      const ctm = cur();
+      const w = Math.hypot(ctm[0], ctm[1]);
+      const h = Math.hypot(ctm[2], ctm[3]);
+      const yPdf = ctm[5];
+      const yTop = pageH - (yPdf + h);
+      const oo = img as { width?: number; height?: number };
+      if ((oo.width ?? 0) < 24 || (oo.height ?? 0) < 24) continue;
+      let dataUrl: string | null = null;
+      try { dataUrl = await imageObjectToDataUrl(img); } catch { continue; }
+      if (!dataUrl) continue;
       out.push({ dataUrl, y: yTop, w, h });
     }
   }
