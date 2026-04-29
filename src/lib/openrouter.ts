@@ -1,17 +1,9 @@
 import type { OpenRouterModel } from "./types";
 
-/** Default OpenRouter API key embedded by repo owner.
- *
- *  ⚠️ WARNING: this site is public on GitHub Pages and the source repo is
- *  public. Anyone visiting the page can extract this key from the bundle in a
- *  few clicks and use it on the owner's OpenRouter account. The key was added
- *  here at the explicit request of the repo owner.
- *
- *  The string is split into parts only to avoid trivial GitHub secret scanners
- *  flagging the commit; this provides NO real security.
- */
-const _PARTS = ["sk-or-v1-", "1c16605fb3933c4d4363dc0bcaeb4bfb", "0e334c9b0240f6504aa581809a20667"];
-export const DEFAULT_API_KEY = _PARTS.join("");
+/** No API key is embedded. Users must provide their own OpenRouter key in the
+ *  UI. The key is stored in localStorage of the user's browser only — never
+ *  sent to the repo or to any server other than openrouter.ai. */
+export const DEFAULT_API_KEY = "";
 
 export const FREE_MODELS: OpenRouterModel[] = [
   { id: "openai/gpt-oss-120b:free",              label: "GPT-OSS 120B — рекомендуется",     vision: false, context: 131072 },

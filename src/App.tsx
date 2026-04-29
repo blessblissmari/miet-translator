@@ -42,11 +42,11 @@ function useLocalStorage<T extends string>(key: string, def: T): [T, (v: T) => v
 }
 
 export default function App() {
-  const [overrideKey, setOverrideKey] = useLocalStorage<string>("openrouter_key_override", "");
+  const [overrideKey, setOverrideKey] = useLocalStorage<string>("openrouter_key", "");
   const apiKey = overrideKey.trim() || DEFAULT_API_KEY;
-  const usingDefaultKey = !overrideKey.trim();
+  const hasKey = !!apiKey;
   const [model, setModel] = useLocalStorage<string>("openrouter_model", DEFAULT_MODEL);
-  const [showSettings, setShowSettings] = useState(false);
+  const [showSettings, setShowSettings] = useState(!apiKey);
 
   const [unsorted, setUnsorted] = useState<UnsortedItem[]>([]);
   const [items, setItems] = useState<QueueItem[]>([]);
@@ -237,19 +237,27 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <h1>MIET Translator</h1>
-        <button className="ghost" onClick={() => setShowSettings(s => !s)}>
-          {showSettings ? "Скрыть настройки" : "Настройки"}
-        </button>
+        <div className="topbar-right">
+          {!hasKey && <span className="key-warning" onClick={() => setShowSettings(true)}>⚠ Нужен ключ OpenRouter</span>}
+          <button className="ghost" onClick={() => setShowSettings(s => !s)}>
+            {showSettings ? "Скрыть настройки" : "Настройки"}
+          </button>
+        </div>
       </header>
 
       {showSettings && (
         <section className="settings">
-          <p className="muted small">Используется встроенный ключ. Можно вставить свой — он сохранится в этом браузере.</p>
-          <label>
-            Свой OpenRouter ключ{" "}
-            <input type="password" value={overrideKey} onChange={e => setOverrideKey(e.target.value)}
-              placeholder={usingDefaultKey ? "(встроенный активен)" : ""} autoComplete="off" spellCheck={false} />
-          </label>
+          <div className={`key-row ${hasKey ? "key-ok" : "key-missing"}`}>
+            <label>
+              <strong>OpenRouter API key</strong>
+              <input type="password" value={overrideKey} onChange={e => setOverrideKey(e.target.value)}
+                placeholder="sk-or-v1-…" autoComplete="off" spellCheck={false} />
+            </label>
+            <p className="muted small">
+              {hasKey ? "Ключ сохранён в браузере (localStorage). Ни на GitHub, ни куда-то ещё он не уходит — только прямо в openrouter.ai."
+                     : <>Без ключа перевод работать не будет. Бесплатный ключ можно получить на <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer">openrouter.ai/keys</a>. Он хранится только в этом браузере.</>}
+            </p>
+          </div>
           <label>
             Модель{" "}
             <select value={model} onChange={e => setModel(e.target.value)}>
@@ -279,7 +287,8 @@ export default function App() {
           </div>
 
           <div className="queue-controls">
-            <button className="primary" onClick={runAll} disabled={running || totalQueued === 0}>
+            <button className="primary" onClick={runAll} disabled={running || totalQueued === 0 || !hasKey}
+                    title={!hasKey ? "Добавь OpenRouter ключ в Настройках" : ""}>
               {running ? "Обработка…" : `Запустить (${totalQueued})`}
             </button>
             {running && <button className="ghost" onClick={cancelAll}>Стоп</button>}

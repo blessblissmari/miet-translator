@@ -280,3 +280,13 @@ select.q-kind.kind-document    { color: #a78bfa; border-color: #a78bfa; }
 .doc-preview .doc-table { border-collapse: collapse; width: 100%; margin: 12px 0; background: white; }
 .doc-preview .doc-table th, .doc-preview .doc-table td { border: 1px solid #d0d0d0; padding: 6px 10px; color: #1a202c; font-size: 13px; vertical-align: top; }
 .doc-preview .doc-table th { background: #f1f5f9; font-weight: 600; }
+
+.topbar-right { display: flex; gap: 12px; align-items: center; }
+.key-warning { color: #f59e0b; font-size: 13px; cursor: pointer; padding: 4px 10px; border: 1px solid #f59e0b; border-radius: 6px; }
+.key-warning:hover { background: rgba(245,158,11,0.1); }
+.key-row { padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+.key-row.key-missing { background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.4); }
+.key-row.key-ok { background: rgba(74,222,128,0.05); border: 1px solid rgba(74,222,128,0.25); }
+.key-row label { display: block; }
+.key-row input { width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px; }
+.key-row a { color: var(--accent); }
