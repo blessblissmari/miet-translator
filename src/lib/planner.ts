@@ -107,13 +107,20 @@ export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Pr
 }
 
 async function planSlideRobust(
-  page: { text: string; imageDataUrl: string; index: number },
+  page: { text: string; imageDataUrl: string; index: number; images?: { dataUrl: string; y: number; w: number; h: number }[] },
   opts: PlannerOpts,
 ): Promise<SlidePlan> {
+  // Pick the best actual figure on this slide (largest by area among extracted images).
+  // Falls back to the rasterized page only if NO real figures were extracted AND the slide is image-dominated.
+  const realImages = (page.images || []).filter(im => im.w * im.h > 80 * 80);
+  const bestImg = realImages.length > 0
+    ? realImages.slice().sort((a, b) => (b.w * b.h) - (a.w * a.h))[0].dataUrl
+    : null;
+
   // Primary: structured JSON
   try {
     const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
-      { type: "text", text: `Slide raw text:\n\n${page.text.slice(0, 6000)}` },
+      { type: "text", text: `Slide raw text:\n\n${page.text.slice(0, 6000)}\n\nThis slide has ${realImages.length} embedded figure(s).` },
     ];
     if (opts.visionCapable) userContent.push({ type: "image_url", image_url: { url: page.imageDataUrl } });
     const out = await chat({
@@ -133,15 +140,21 @@ async function planSlideRobust(
       ? parsed.layout
       : "title-text") as SlidePlan["layout"];
     if (parsed.isSectionTitle) layout = "section-title";
+    // Coerce layout to match what we actually have: no image → no image-layout.
+    if (!bestImg && (layout === "title-text-image-right" || layout === "title-text-image-left" || layout === "title-image")) {
+      layout = "title-text";
+    }
+    if (bestImg && layout === "title-text") {
+      layout = "title-text-image-right";
+    }
     return {
       title: (parsed.title || "").trim(),
       bullets: (parsed.bullets || []).map(b => b.trim()).filter(Boolean),
       layout,
-      imageDataUrl: layout === "section-title" ? undefined : page.imageDataUrl,
+      imageDataUrl: layout === "section-title" ? undefined : (bestImg ?? undefined),
     };
   } catch (e1) {
     opts.onLog?.(`Слайд ${page.index + 1}: JSON упал, делаю plain-перевод (${(e1 as Error).message.slice(0, 80)})`);
-    // Fallback: plain translation → bullets per line
     const plain = await chat({
       apiKey: opts.apiKey,
       model: opts.model,
@@ -153,11 +166,11 @@ async function planSlideRobust(
         { role: "user", content: page.text.slice(0, 6000) },
       ],
     });
-    return parseSlideFromPlain(stripCodeFences(plain), page.imageDataUrl);
+    return parseSlideFromPlain(stripCodeFences(plain), bestImg);
   }
 }
 
-function parseSlideFromPlain(md: string, imageDataUrl: string): SlidePlan {
+function parseSlideFromPlain(md: string, imageDataUrl: string | null): SlidePlan {
   const lines = md.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   let title = lines.shift() || "";
   title = title.replace(/^#+\s*/, "");
@@ -166,13 +179,13 @@ function parseSlideFromPlain(md: string, imageDataUrl: string): SlidePlan {
     const m = ln.match(/^[-*•]\s+(.*)$/);
     if (m) bullets.push(m[1].trim());
     else if (bullets.length === 0) {
-      // Maybe model didn't use bullets — split by sentence
       bullets.push(ln);
     } else {
       bullets[bullets.length - 1] += " " + ln;
     }
   }
-  return { title, bullets: bullets.slice(0, 12), layout: "title-text-image-right", imageDataUrl };
+  const layout: SlidePlan["layout"] = imageDataUrl ? "title-text-image-right" : "title-text";
+  return { title, bullets: bullets.slice(0, 12), layout, imageDataUrl: imageDataUrl ?? undefined };
 }
 
 export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promise<DocPlan> {
