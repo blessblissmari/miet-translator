@@ -165,9 +165,10 @@ async function extractDocx(blob: Blob): Promise<ExtractedDoc> {
 async function extractImage(blob: Blob, filename: string): Promise<ExtractedDoc> {
   const dataUrl = await blobToDataUrl(blob);
   const dims = await imageDims(dataUrl);
+  // text = "" so that the planner triggers its vision-OCR / handwriting path.
   return {
-    pages: [{ index: 0, text: filename, imageDataUrl: dataUrl, width: dims.w, height: dims.h }],
-    meta: {},
+    pages: [{ index: 0, text: "", imageDataUrl: dataUrl, width: dims.w, height: dims.h }],
+    meta: { title: filename.replace(/\.[^.]+$/, "") },
   };
 }
 
