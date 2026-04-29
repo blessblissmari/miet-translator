@@ -1,5 +1,5 @@
 import { chat, parseJsonLoose } from "./openrouter";
-import type { SlidePlan, DocPlan, ExtractedDoc } from "./types";
+import type { SlidePlan, DocPlan, DocBlock, ExtractedDoc } from "./types";
 
 export interface PlannerOpts {
   apiKey: string;
@@ -20,72 +20,78 @@ const SLIDE_LAYOUTS = [
   "title-image",
 ] as const;
 
-const SLIDE_PROMPT = (lang: string, validLayouts: string) => `You are converting a single slide of an English academic presentation into a localized slide for a MIET (Russian university) template.
+const SLIDE_PROMPT = (lang: string, validLayouts: string) => `You convert one academic English slide into a localized slide for a MIET (Russian university) template.
 
 Target language: ${lang}.
 
-Rules:
-- Translate the slide's content into ${lang}. Keep mathematical formulas, code, and proper names as-is.
-- Output ONLY valid JSON (no commentary, no markdown), matching this schema:
-  { "title": string, "bullets": string[], "layout": one of [${validLayouts}], "isSectionTitle": boolean }
-- Pick "section-title" only if the slide is purely a chapter/section heading.
-- Pick "title-image" if the slide is dominated by a figure/diagram with little text.
-- Pick "title-text-image-right" if the slide has substantial text alongside a meaningful figure.
-- Otherwise use "title-text".
-- Keep bullets concise (<= 12 bullets, <= 220 chars each). Preserve the ORDER of the original points.
-- Title must be a short ${lang} phrase, NOT a sentence.
-`;
-
-const DOC_PROMPT = (lang: string) => `You are reformatting an English academic document (homework / lecture / problem set) into a structured JSON document, translated to ${lang}.
+Output ONLY valid JSON (no commentary, no markdown fences) matching:
+{ "title": string, "bullets": string[], "layout": one of [${validLayouts}], "isSectionTitle": boolean }
 
 Rules:
-- Translate prose into ${lang}. Keep math, code, identifiers, and proper names as-is.
-- Output ONLY valid JSON, matching this schema:
-  { "title": string, "blocks": Block[] }
-  where Block is one of:
-    { "type": "h1" | "h2" | "h3" | "para", "text": string }
-    { "type": "list", "ordered": boolean, "items": string[] }
-    { "type": "formula", "latex": string, "display": boolean }
-- Use display formulas (display=true) for centered standalone equations; inline (display=false) for short formulas inside a sentence — but inline formulas must still be a separate "formula" block (the docx builder will inline-render them). For text containing inline math, split into: para text up to the formula → formula → para text after.
-- Use "list" for enumerated/bulleted item lists.
-- Preserve the original structure (problems, sub-questions). Use h2/h3 for section headers like "Question #1", "Part (a)", etc.
-- Convert any LaTeX-able math (subscripts, fractions, sums, integrals) to LaTeX in "latex".
-- Do NOT include figures here; they will be added separately. If the original mentions a figure, leave a short note like "(см. рис. ниже)" in the prose.
+- Translate slide content into ${lang}. Keep math formulas, code, identifiers, proper names verbatim.
+- Inside bullets, keep math in LaTeX delimiters: $...$ (inline) and $$...$$ (display).
+- Pick "section-title" only for pure chapter/section heading slides.
+- Pick "title-image" if the slide is dominated by a figure with little text.
+- Pick "title-text-image-right" if substantial text alongside a meaningful figure.
+- Otherwise "title-text".
+- Bullets concise (<= 12 items, <= 220 chars each). Preserve original order.
+- Title is a short ${lang} phrase, NOT a sentence.
 `;
 
-async function planSlide(
-  pageText: string,
-  pageImage: string,
+const DOC_TRANSLATE_PROMPT = (lang: string) => `You are a senior technical translator specializing in academic and engineering literature for Russian universities.
+
+Task: translate the academic page below into ${lang} ("русский"), with the tone and terminology used in formal Russian university coursework (МИЭТ-style).
+
+STYLE rules:
+- Use formal, academic ${lang}. Prefer established Russian technical terminology over literal/calque translations. Examples:
+  - "transistor" → «транзистор»
+  - "small-signal model" → «модель для малого сигнала»
+  - "cut-off frequency" → «частота среза»
+  - "homework" → «домашнее задание»
+  - "Question N" → «Задача N»
+  - "Solution" → «Решение»
+  - "Part (a)" → «Часть (а)» or «Пункт (а)»
+  - "Show that" → «Покажите, что»
+  - "Find" → «Найдите»
+- Do NOT translate code, identifiers, variable names, units, or proper names (Ohm, Faraday, MOSFET, etc.).
+- Preserve abbreviations: BJT, MOSFET, DC, AC, SI, etc.
+- Translate the meaning, not word-by-word. Output must read as if originally written by a Russian engineering professor.
+
+STRUCTURE rules:
+- Output ONLY the translated Markdown. No commentary. No code fences. No "Here is the translation".
+- Preserve EVERY mathematical formula. Use LaTeX inside $...$ for inline math and $$...$$ on its own line for displayed equations. NEVER omit a formula. If the page is heavy with formulas, EVERY formula must appear in the output.
+- Use Markdown structure:
+  - "# Title" for top-level title (only if the page is a cover/title page).
+  - "## Heading" / "### Subheading" for section/sub-section headings.
+  - "- item" for unordered lists, "1. item" for ordered lists.
+  - Plain paragraphs for prose.
+- Preserve numbering of problems and sub-questions exactly.
+- If the page mentions a figure that you cannot reproduce in text, leave a short marker "(см. рис. на стр. ${"{N}"})".
+- For tables: render as Markdown tables with | separators. The downstream pipeline will rebuild them as native DOCX tables.
+`;
+
+async function translateDocPage(
+  page: { text: string; imageDataUrl: string; index: number },
   opts: PlannerOpts,
-): Promise<SlidePlan> {
+): Promise<DocBlock[]> {
   const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
-    { type: "text", text: `Slide raw text:\n\n${pageText.slice(0, 6000)}\n\n${opts.visionCapable ? "Slide image is also attached." : ""}` },
+    { type: "text", text: `Translate the following page (page ${page.index + 1}) into ${TARGET_LANG}. Use Markdown as instructed.\n\n${page.text.slice(0, 12000)}` },
   ];
-  if (opts.visionCapable) userContent.push({ type: "image_url", image_url: { url: pageImage } });
-
+  if (opts.visionCapable && page.imageDataUrl) {
+    userContent.push({ type: "image_url", image_url: { url: page.imageDataUrl } });
+  }
   const out = await chat({
     apiKey: opts.apiKey,
     model: opts.model,
     temperature: 0.2,
-    maxTokens: 2048,
-    responseJson: true,
+    maxTokens: 4096,
     signal: opts.signal,
     messages: [
-      { role: "system", content: SLIDE_PROMPT(TARGET_LANG, SLIDE_LAYOUTS.map(l => `"${l}"`).join(", ")) },
+      { role: "system", content: DOC_TRANSLATE_PROMPT(TARGET_LANG) },
       { role: "user", content: userContent },
     ],
   });
-  const parsed = parseJsonLoose<{ title?: string; bullets?: string[]; layout?: string; isSectionTitle?: boolean }>(out);
-  let layout = (parsed.layout && (SLIDE_LAYOUTS as readonly string[]).includes(parsed.layout)
-    ? parsed.layout
-    : "title-text") as SlidePlan["layout"];
-  if (parsed.isSectionTitle) layout = "section-title";
-  return {
-    title: (parsed.title || "").trim(),
-    bullets: (parsed.bullets || []).map(b => b.trim()).filter(Boolean),
-    layout,
-    imageDataUrl: layout === "section-title" ? undefined : pageImage,
-  };
+  return parseMarkdownToBlocks(stripCodeFences(out));
 }
 
 export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Promise<SlidePlan[]> {
@@ -93,62 +99,230 @@ export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Pr
   for (let i = 0; i < extracted.pages.length; i++) {
     const page = extracted.pages[i];
     opts.onLog?.(`Перевод слайда ${i + 1}/${extracted.pages.length}…`);
-    try {
-      const plan = await planSlide(page.text, page.imageDataUrl, opts);
-      plans.push(plan);
-    } catch (e) {
-      opts.onLog?.(`Слайд ${i + 1}: ошибка LLM — оставляю исходник как картинку. (${(e as Error).message})`);
-      plans.push({ title: "", bullets: [], layout: "title-image", imageDataUrl: page.imageDataUrl });
-    }
+    const plan = await planSlideRobust(page, opts);
+    plans.push(plan);
     opts.onProgress?.(i + 1, extracted.pages.length);
   }
   return plans;
 }
 
-export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promise<DocPlan> {
-  // Process pages in batches to fit within free-tier rate limits.
-  const BATCH = 4;
-  const allBlocks: DocPlan["blocks"] = [];
-  let title = extracted.meta.title || "";
-
-  for (let i = 0; i < extracted.pages.length; i += BATCH) {
-    const slice = extracted.pages.slice(i, i + BATCH);
-    opts.onLog?.(`Перевод страниц ${i + 1}–${i + slice.length}/${extracted.pages.length}…`);
-    const combinedText = slice.map((p, k) => `--- Page ${i + k + 1} ---\n${p.text}`).join("\n\n");
-
+async function planSlideRobust(
+  page: { text: string; imageDataUrl: string; index: number },
+  opts: PlannerOpts,
+): Promise<SlidePlan> {
+  // Primary: structured JSON
+  try {
     const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
-      { type: "text", text: `Document text (multi-page):\n\n${combinedText.slice(0, 12000)}` },
+      { type: "text", text: `Slide raw text:\n\n${page.text.slice(0, 6000)}` },
     ];
-    if (opts.visionCapable) {
-      // Attach first page image of the batch as visual context
-      userContent.push({ type: "image_url", image_url: { url: slice[0].imageDataUrl } });
-    }
+    if (opts.visionCapable) userContent.push({ type: "image_url", image_url: { url: page.imageDataUrl } });
+    const out = await chat({
+      apiKey: opts.apiKey,
+      model: opts.model,
+      temperature: 0.2,
+      maxTokens: 1024,
+      responseJson: true,
+      signal: opts.signal,
+      messages: [
+        { role: "system", content: SLIDE_PROMPT(TARGET_LANG, SLIDE_LAYOUTS.map(l => `"${l}"`).join(", ")) },
+        { role: "user", content: userContent },
+      ],
+    });
+    const parsed = parseJsonLoose<{ title?: string; bullets?: string[]; layout?: string; isSectionTitle?: boolean }>(out);
+    let layout = (parsed.layout && (SLIDE_LAYOUTS as readonly string[]).includes(parsed.layout)
+      ? parsed.layout
+      : "title-text") as SlidePlan["layout"];
+    if (parsed.isSectionTitle) layout = "section-title";
+    return {
+      title: (parsed.title || "").trim(),
+      bullets: (parsed.bullets || []).map(b => b.trim()).filter(Boolean),
+      layout,
+      imageDataUrl: layout === "section-title" ? undefined : page.imageDataUrl,
+    };
+  } catch (e1) {
+    opts.onLog?.(`Слайд ${page.index + 1}: JSON упал, делаю plain-перевод (${(e1 as Error).message.slice(0, 80)})`);
+    // Fallback: plain translation → bullets per line
+    const plain = await chat({
+      apiKey: opts.apiKey,
+      model: opts.model,
+      temperature: 0.2,
+      maxTokens: 1024,
+      signal: opts.signal,
+      messages: [
+        { role: "system", content: `Translate the slide content into ${TARGET_LANG}. Output a short ${TARGET_LANG} title on the first line, then up to 8 bullet lines starting with "- ". Keep math in $...$ or $$...$$. No commentary.` },
+        { role: "user", content: page.text.slice(0, 6000) },
+      ],
+    });
+    return parseSlideFromPlain(stripCodeFences(plain), page.imageDataUrl);
+  }
+}
 
-    let parsed: { title?: string; blocks?: DocPlan["blocks"] };
-    try {
-      const out = await chat({
-        apiKey: opts.apiKey,
-        model: opts.model,
-        temperature: 0.2,
-        maxTokens: 4096,
-        responseJson: true,
-        signal: opts.signal,
-        messages: [
-          { role: "system", content: DOC_PROMPT(TARGET_LANG) },
-          { role: "user", content: userContent },
-        ],
-      });
-      parsed = parseJsonLoose(out);
-    } catch (e) {
-      opts.onLog?.(`Батч ошибся, вставляю страницы как рисунки. (${(e as Error).message})`);
-      parsed = {
-        blocks: slice.map(p => ({ type: "figure" as const, imageDataUrl: p.imageDataUrl, caption: `Страница ${p.index + 1}` })),
-      };
+function parseSlideFromPlain(md: string, imageDataUrl: string): SlidePlan {
+  const lines = md.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  let title = lines.shift() || "";
+  title = title.replace(/^#+\s*/, "");
+  const bullets: string[] = [];
+  for (const ln of lines) {
+    const m = ln.match(/^[-*•]\s+(.*)$/);
+    if (m) bullets.push(m[1].trim());
+    else if (bullets.length === 0) {
+      // Maybe model didn't use bullets — split by sentence
+      bullets.push(ln);
+    } else {
+      bullets[bullets.length - 1] += " " + ln;
     }
-    if (!title && parsed.title) title = parsed.title;
-    if (parsed.blocks) allBlocks.push(...parsed.blocks);
-    opts.onProgress?.(Math.min(i + BATCH, extracted.pages.length), extracted.pages.length);
+  }
+  return { title, bullets: bullets.slice(0, 12), layout: "title-text-image-right", imageDataUrl };
+}
+
+export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promise<DocPlan> {
+  const allBlocks: DocBlock[] = [];
+  let title: string | undefined;
+  const errors: string[] = [];
+
+  for (let i = 0; i < extracted.pages.length; i++) {
+    const page = extracted.pages[i];
+    opts.onLog?.(`Перевод страницы ${i + 1}/${extracted.pages.length}…`);
+    try {
+      const blocks = await translateDocPage(page, opts);
+      // Lift first h1 into title if doc has none yet
+      if (!title && blocks.length > 0 && blocks[0].type === "h1") {
+        const h1 = blocks.shift() as DocBlock;
+        if (h1.type === "h1") title = h1.text;
+      }
+      if (blocks.length === 0) {
+        // LLM returned empty — keep page raw text
+        if (page.text.trim()) allBlocks.push({ type: "para", text: page.text.trim() });
+      } else {
+        allBlocks.push(...blocks);
+      }
+    } catch (e) {
+      const msg = (e as Error).message;
+      errors.push(`Страница ${i + 1}: ${msg}`);
+      opts.onLog?.(`Ошибка на странице ${i + 1}: ${msg.slice(0, 120)}`);
+      // No image fallback — just put a clear marker so the user can re-run
+      allBlocks.push({
+        type: "para",
+        text: `⚠ Страница ${i + 1}: не удалось перевести (${msg}). Исходный текст ниже.`,
+      });
+      if (page.text.trim()) allBlocks.push({ type: "para", text: page.text.trim() });
+    }
+    opts.onProgress?.(i + 1, extracted.pages.length);
+  }
+
+  if (errors.length === extracted.pages.length) {
+    throw new Error(`Перевод не удался ни на одной странице: ${errors[0]}`);
   }
 
   return { title: title || "Документ", blocks: allBlocks };
+}
+
+/** Strip ```...``` fences if a model returns them despite instructions. */
+export function stripCodeFences(s: string): string {
+  const t = s.trim();
+  const m = t.match(/^```(?:\w+)?\s*([\s\S]*?)\s*```$/);
+  return m ? m[1] : t;
+}
+
+/** Convert Markdown (with $...$ / $$...$$ math) into DocBlock[]. */
+export function parseMarkdownToBlocks(md: string): DocBlock[] {
+  const lines = md.split(/\r?\n/);
+  const blocks: DocBlock[] = [];
+  let listItems: string[] = [];
+  let listOrdered = false;
+  let listActive = false;
+  let inDisplayMath = false;
+  let displayBuffer: string[] = [];
+  const paraBuffer: string[] = [];
+
+  const flushList = () => {
+    if (listActive && listItems.length) blocks.push({ type: "list", ordered: listOrdered, items: listItems });
+    listItems = [];
+    listActive = false;
+  };
+  const flushPara = () => {
+    const text = paraBuffer.join(" ").replace(/\s+/g, " ").trim();
+    if (text) blocks.push({ type: "para", text });
+    paraBuffer.length = 0;
+  };
+  const flushAll = () => { flushList(); flushPara(); };
+
+  for (let li = 0; li < lines.length; li++) {
+    const raw = lines[li];
+    const line = raw.replace(/\s+$/, "");
+
+    // Markdown table detection: look ahead for | header | + | --- | --- | rows
+    if (!inDisplayMath && /\|/.test(line) && line.trim().startsWith("|") && line.trim().endsWith("|")) {
+      const next = (lines[li + 1] || "").trim();
+      if (/^\|?\s*:?-{2,}.*\|/.test(next)) {
+        const rows: string[][] = [];
+        const headerCells = line.split("|").slice(1, -1).map(c => c.trim());
+        rows.push(headerCells);
+        li += 1; // skip separator
+        while (li + 1 < lines.length) {
+          const nl = lines[li + 1].trim();
+          if (!nl.startsWith("|") || !nl.endsWith("|")) break;
+          li++;
+          const cells = lines[li].split("|").slice(1, -1).map(c => c.trim());
+          rows.push(cells);
+        }
+        flushAll();
+        blocks.push({ type: "table", rows, header: true });
+        continue;
+      }
+    }
+
+    if (inDisplayMath) {
+      const close = line.match(/^(.*)\$\$\s*$/);
+      if (close) {
+        if (close[1]) displayBuffer.push(close[1]);
+        const latex = displayBuffer.join("\n").trim();
+        if (latex) blocks.push({ type: "formula", latex, display: true });
+        displayBuffer = [];
+        inDisplayMath = false;
+      } else {
+        displayBuffer.push(line);
+      }
+      continue;
+    }
+    const trimmed = line.trim();
+    // single-line $$...$$
+    const oneLine = trimmed.match(/^\$\$([\s\S]+?)\$\$$/);
+    if (oneLine) {
+      flushAll();
+      blocks.push({ type: "formula", latex: oneLine[1].trim(), display: true });
+      continue;
+    }
+    // open display math
+    if (/^\$\$/.test(trimmed)) {
+      flushAll();
+      inDisplayMath = true;
+      const rest = trimmed.replace(/^\$\$/, "");
+      if (rest) displayBuffer.push(rest);
+      continue;
+    }
+    if (trimmed === "") { flushAll(); continue; }
+    let m;
+    if ((m = trimmed.match(/^#\s+(.+)/))) { flushAll(); blocks.push({ type: "h1", text: m[1].trim() }); continue; }
+    if ((m = trimmed.match(/^##\s+(.+)/))) { flushAll(); blocks.push({ type: "h2", text: m[1].trim() }); continue; }
+    if ((m = trimmed.match(/^###\s+(.+)/))) { flushAll(); blocks.push({ type: "h3", text: m[1].trim() }); continue; }
+    if ((m = trimmed.match(/^[-*•]\s+(.+)/))) {
+      flushPara();
+      if (listActive && listOrdered) flushList();
+      listActive = true; listOrdered = false;
+      listItems.push(m[1].trim());
+      continue;
+    }
+    if ((m = trimmed.match(/^\d+[.)]\s+(.+)/))) {
+      flushPara();
+      if (listActive && !listOrdered) flushList();
+      listActive = true; listOrdered = true;
+      listItems.push(m[1].trim());
+      continue;
+    }
+    flushList();
+    paraBuffer.push(trimmed);
+  }
+  flushAll();
+  return blocks;
 }

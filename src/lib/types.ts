@@ -35,7 +35,8 @@ export type DocBlock =
   | { type: "h1" | "h2" | "h3" | "para"; text: string }
   | { type: "formula"; latex: string; display?: boolean }
   | { type: "figure"; imageDataUrl: string; caption?: string }
-  | { type: "list"; ordered: boolean; items: string[] };
+  | { type: "list"; ordered: boolean; items: string[] }
+  | { type: "table"; rows: string[][]; header?: boolean };
 
 export interface DocPlan {
   title: string;
