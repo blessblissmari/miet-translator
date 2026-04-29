@@ -1,11 +1,24 @@
 export type TargetLang = "ru" | "en";
 
+export interface ExtractedImage {
+  dataUrl: string;
+  /** Approximate Y position on the page in PDF coords (top of image, top=0). */
+  y: number;
+  /** PDF-space width/height for sizing hints. */
+  w: number;
+  h: number;
+}
+
 export interface ExtractedPage {
   index: number;          // 0-based
   text: string;           // raw text from the PDF page
-  imageDataUrl: string;   // PNG data URL of the rendered page (used as a fallback "graphic")
+  imageDataUrl: string;   // PNG data URL of the rendered full page (fallback)
   width: number;
   height: number;
+  /** Embedded raster images extracted from the page, top-to-bottom order. */
+  images?: ExtractedImage[];
+  /** Lines of text with bounding boxes for layout-preserving downstream use. */
+  lines?: Array<{ text: string; x: number; y: number; w: number; h: number; fontSize: number }>;
 }
 
 export interface ExtractedDoc {

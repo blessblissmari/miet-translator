@@ -71,7 +71,7 @@ STRUCTURE rules:
 `;
 
 async function translateDocPage(
-  page: { text: string; imageDataUrl: string; index: number },
+  page: { text: string; imageDataUrl: string; index: number; images?: { dataUrl: string; y: number; w: number; h: number }[] },
   opts: PlannerOpts,
 ): Promise<DocBlock[]> {
   const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
@@ -195,6 +195,17 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
         if (page.text.trim()) allBlocks.push({ type: "para", text: page.text.trim() });
       } else {
         allBlocks.push(...blocks);
+      }
+      // Append extracted images (real figures from the PDF) at the end of the page block group.
+      const imgs = page.images || [];
+      for (let k = 0; k < imgs.length; k++) {
+        allBlocks.push({
+          type: "figure",
+          imageDataUrl: imgs[k].dataUrl,
+          caption: imgs.length === 1
+            ? `Рис. ${i + 1}`
+            : `Рис. ${i + 1}.${k + 1}`,
+        });
       }
     } catch (e) {
       const msg = (e as Error).message;
