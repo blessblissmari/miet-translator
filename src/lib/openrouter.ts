@@ -6,11 +6,14 @@ import type { OpenRouterModel } from "./types";
 export const DEFAULT_API_KEY = "";
 
 export const FREE_MODELS: OpenRouterModel[] = [
-  { id: "google/gemma-3-27b-it:free",            label: "Gemma 3 27B — vision (рекомендуется для рукописи/сканов)", vision: true,  context: 131072 },
-  { id: "google/gemma-3-12b-it:free",            label: "Gemma 3 12B — vision (быстрее)",                            vision: true,  context: 32768  },
-  { id: "openai/gpt-oss-120b:free",              label: "GPT-OSS 120B — только текст, для печатных PDF",             vision: false, context: 131072 },
-  { id: "z-ai/glm-4.5-air:free",                 label: "GLM 4.5 Air — только текст",                                 vision: false, context: 131072 },
-  { id: "qwen/qwen3-next-80b-a3b-instruct:free", label: "Qwen3 Next 80B — только текст, длинный контекст",            vision: false, context: 262144 },
+  // Vision-capable: handles printed text, scans, and handwriting.
+  { id: "google/gemma-4-26b-a4b-it:free",        label: "Gemma 4 26B — vision (рекомендуется, академический русский)", vision: true,  context: 262144 },
+  { id: "nvidia/nemotron-nano-12b-v2-vl:free",   label: "Nemotron Nano 12B VL — vision (Nvidia, без рейт-лимитов Google)", vision: true, context: 128000 },
+  { id: "google/gemma-3-27b-it:free",            label: "Gemma 3 27B — vision (часто rate-limited)",                  vision: true,  context: 131072 },
+  { id: "google/gemma-3-12b-it:free",            label: "Gemma 3 12B — vision (быстрее, тот же лимит)",                vision: true,  context: 32768  },
+  // Text-only: faster + reliable for printed PDFs without need for image OCR.
+  { id: "openai/gpt-oss-120b:free",              label: "GPT-OSS 120B — только текст, очень стабильна",                vision: false, context: 131072 },
+  { id: "z-ai/glm-4.5-air:free",                 label: "GLM 4.5 Air — только текст, стабильна",                       vision: false, context: 131072 },
 ];
 
 export const DEFAULT_MODEL = FREE_MODELS[0].id;
@@ -69,9 +72,57 @@ function describeError(e: unknown): string {
   try { return JSON.stringify(e); } catch { return String(e); }
 }
 
+/** Models to try after the primary one if it's persistently rate-limited.
+ *  Pick fallbacks of the matching capability tier. */
+function fallbackChain(primary: string, hasImage: boolean): string[] {
+  const chain: string[] = [primary];
+  if (hasImage) {
+    // Need vision-capable models
+    if (!chain.includes("google/gemma-4-26b-a4b-it:free")) chain.push("google/gemma-4-26b-a4b-it:free");
+    if (!chain.includes("nvidia/nemotron-nano-12b-v2-vl:free")) chain.push("nvidia/nemotron-nano-12b-v2-vl:free");
+    if (!chain.includes("google/gemma-3-27b-it:free")) chain.push("google/gemma-3-27b-it:free");
+  } else {
+    if (!chain.includes("openai/gpt-oss-120b:free")) chain.push("openai/gpt-oss-120b:free");
+    if (!chain.includes("z-ai/glm-4.5-air:free")) chain.push("z-ai/glm-4.5-air:free");
+    if (!chain.includes("google/gemma-4-26b-a4b-it:free")) chain.push("google/gemma-4-26b-a4b-it:free");
+  }
+  return chain;
+}
+
+function messagesHaveImage(messages: ChatMessage[]): boolean {
+  for (const m of messages) {
+    if (Array.isArray(m.content)) {
+      for (const part of m.content) if (part.type === "image_url") return true;
+    }
+  }
+  return false;
+}
+
 export async function chat(opts: ChatOptions): Promise<string> {
   if (!opts.apiKey) throw new Error("Нет ключа OpenRouter. Открой Настройки и вставь ключ с https://openrouter.ai/keys");
 
+  const hasImage = messagesHaveImage(opts.messages);
+  const chain = fallbackChain(opts.model, hasImage);
+
+  let lastErr: unknown = new Error("no attempts made");
+  for (let mi = 0; mi < chain.length; mi++) {
+    const model = chain[mi];
+    try {
+      return await chatOnce({ ...opts, model });
+    } catch (e) {
+      lastErr = e;
+      // Only fall through to next model on rate-limit / server error / no-completion.
+      // Fatal client errors (400/401/402/403/404) should stop the chain.
+      if (e instanceof OpenRouterError && e.fatal) throw e;
+      if ((e as { name?: string })?.name === "AbortError") throw e;
+      // Otherwise: try the next model in the chain
+      continue;
+    }
+  }
+  throw new Error(`OpenRouter не ответил после ретраев и фолбэков: ${describeError(lastErr)}`);
+}
+
+async function chatOnce(opts: ChatOptions): Promise<string> {
   const body: Record<string, unknown> = {
     model: opts.model,
     messages: opts.messages,
@@ -81,7 +132,7 @@ export async function chat(opts: ChatOptions): Promise<string> {
   if (opts.responseJson) body.response_format = { type: "json_object" };
 
   let lastErr: unknown = new Error("no attempts made");
-  for (let attempt = 0; attempt < 4; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const res = await fetch(ENDPOINT, {
         method: "POST",
