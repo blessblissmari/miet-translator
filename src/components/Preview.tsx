@@ -32,7 +32,7 @@ export function PdfPreview({ blob }: { blob: Blob }) {
         const ctx = canvas.getContext("2d")!;
         ctx.fillStyle = "#fff";
         ctx.fillRect(0, 0, canvas.width, canvas.height);
-        await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
+        await page.render({ canvasContext: ctx, viewport: vp }).promise;
         ref.current.appendChild(canvas);
       }
     })().catch(console.error);
