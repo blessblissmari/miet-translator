@@ -21,3 +21,19 @@ declare module "temml" {
   const _default: { renderToString: typeof renderToString };
   export default _default;
 }
+
+declare module "libarchive.js" {
+  export class Archive {
+    static init(opts: { workerUrl?: string }): void;
+    static open(file: File | Blob): Promise<{
+      extractFiles(): Promise<Record<string, unknown>>;
+    }>;
+  }
+}
+
+declare module "mammoth/mammoth.browser.js" {
+  export function extractRawText(opts: { arrayBuffer: ArrayBuffer }): Promise<{ value: string; messages: unknown[] }>;
+  export function convertToHtml(opts: { arrayBuffer: ArrayBuffer }): Promise<{ value: string; messages: unknown[] }>;
+  const _default: { extractRawText: typeof extractRawText; convertToHtml: typeof convertToHtml };
+  export default _default;
+}

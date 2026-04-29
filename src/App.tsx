@@ -1,14 +1,35 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import JSZip from "jszip";
 import { saveAs } from "file-saver";
-import { extractPdf } from "./lib/pdfExtract";
 import { planSlides, planDoc } from "./lib/planner";
 import { buildPptx } from "./lib/pptxBuild";
 import { buildDocx } from "./lib/docxBuild";
-import { FREE_MODELS, DEFAULT_MODEL } from "./lib/openrouter";
-import type { TargetLang } from "./lib/types";
+import { FREE_MODELS, DEFAULT_MODEL, DEFAULT_API_KEY } from "./lib/openrouter";
+import { expandInputs, type IntakeFile } from "./lib/intake";
+import { extractAny, suggestKind } from "./lib/extractAny";
+import { PdfPreview, SlidesPreview, DocPreview } from "./components/Preview";
+import { SwipeDeck } from "./components/SwipeDeck";
+import type { SlidePlan, DocPlan } from "./lib/types";
 import "./App.css";
 
-type Mode = "presentation" | "document";
+type Kind = "presentation" | "document";
+
+interface QueueItem {
+  id: string;
+  path: string;
+  blob: Blob;
+  kind: Kind;
+  status: "queued" | "extracting" | "translating" | "building" | "done" | "error";
+  progress: { done: number; total: number } | null;
+  error?: string;
+  message?: string;
+  slides?: SlidePlan[];
+  doc?: DocPlan;
+  resultBlob?: Blob;
+  resultName?: string;
+}
+
+interface UnsortedItem extends IntakeFile { id: string }
 
 function useLocalStorage<T extends string>(key: string, def: T): [T, (v: T) => void] {
   const [v, setV] = useState<T>(() => {
@@ -21,162 +42,401 @@ function useLocalStorage<T extends string>(key: string, def: T): [T, (v: T) => v
 }
 
 export default function App() {
-  const [apiKey, setApiKey] = useLocalStorage<string>("openrouter_key", "");
+  const [overrideKey, setOverrideKey] = useLocalStorage<string>("openrouter_key_override", "");
+  const apiKey = overrideKey.trim() || DEFAULT_API_KEY;
+  const usingDefaultKey = !overrideKey.trim();
   const [model, setModel] = useLocalStorage<string>("openrouter_model", DEFAULT_MODEL);
-  const [mode, setMode] = useLocalStorage<Mode>("mode", "presentation");
-  const [lang, setLang] = useLocalStorage<TargetLang>("lang", "ru");
-  const [file, setFile] = useState<File | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [logs, setLogs] = useState<string[]>([]);
-  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
-  const [resultUrl, setResultUrl] = useState<string | null>(null);
-  const [resultName, setResultName] = useState<string>("");
+  const [showSettings, setShowSettings] = useState(false);
 
-  const visionCapable = useMemo(() => FREE_MODELS.find(m => m.id === model)?.vision ?? false, [model]);
+  const [unsorted, setUnsorted] = useState<UnsortedItem[]>([]);
+  const [items, setItems] = useState<QueueItem[]>([]);
+  const [running, setRunning] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const log = (m: string) => setLogs(prev => [...prev, m]);
+  const visionCapable = FREE_MODELS.find(m => m.id === model)?.vision ?? false;
 
-  async function run() {
-    if (!apiKey) { alert("Введи ключ OpenRouter"); return; }
-    if (!file) { alert("Выбери файл"); return; }
-    setBusy(true);
-    setLogs([]);
-    setResultUrl(null);
-    try {
-      log(`Извлечение содержимого из ${file.name}…`);
-      const ext = file.name.toLowerCase().split(".").pop();
-      if (ext !== "pdf") {
-        log("Пока поддержан только PDF на входе.");
-        setBusy(false);
-        return;
-      }
-      const extracted = await extractPdf(file, (p, t) => setProgress({ done: p, total: t }));
-      log(`Извлечено страниц: ${extracted.pages.length}`);
-      setProgress(null);
+  const updateItem = (id: string, patch: Partial<QueueItem>) =>
+    setItems(prev => prev.map(it => it.id === id ? { ...it, ...patch } : it));
 
-      if (mode === "presentation") {
-        const slides = await planSlides(extracted, {
-          apiKey, model, visionCapable, targetLang: lang,
-          onLog: log,
-          onProgress: (d, t) => setProgress({ done: d, total: t }),
-        });
-        log("Сборка PPTX из шаблона MIET…");
-        const blob = await buildPptx(slides);
-        const name = file.name.replace(/\.pdf$/i, "") + `_MIET_${lang}.pptx`;
-        const url = URL.createObjectURL(blob);
-        setResultUrl(url);
-        setResultName(name);
-        log(`Готово: ${name}`);
-      } else {
-        const docPlan = await planDoc(extracted, {
-          apiKey, model, visionCapable, targetLang: lang,
-          onLog: log,
-          onProgress: (d, t) => setProgress({ done: d, total: t }),
-        });
-        log("Сборка DOCX…");
-        const blob = await buildDocx(docPlan);
-        const name = file.name.replace(/\.pdf$/i, "") + `_${lang}.docx`;
-        const url = URL.createObjectURL(blob);
-        setResultUrl(url);
-        setResultName(name);
-        log(`Готово: ${name}`);
-      }
-    } catch (e) {
-      console.error(e);
-      log(`Ошибка: ${(e as Error).message}`);
-    } finally {
-      setBusy(false);
-      setProgress(null);
+  async function handleFiles(files: FileList | File[]) {
+    const arr = Array.from(files);
+    const inputs = await expandInputs(arr);
+    if (inputs.length === 0) {
+      alert("В выбранных файлах не нашлось поддерживаемых документов.");
+      return;
+    }
+    const newItems: UnsortedItem[] = inputs.map(p => ({
+      ...p,
+      id: `${p.path}_${Math.random().toString(36).slice(2, 7)}`,
+    }));
+    setUnsorted(prev => [...prev, ...newItems]);
+  }
+
+  function commitToQueue(unsortedItem: UnsortedItem, kind: Kind) {
+    setUnsorted(prev => prev.filter(u => u.id !== unsortedItem.id));
+    const queueItem: QueueItem = {
+      id: unsortedItem.id,
+      path: unsortedItem.path,
+      blob: unsortedItem.blob,
+      kind,
+      status: "queued",
+      progress: null,
+    };
+    setItems(prev => [...prev, queueItem]);
+    if (!selectedId) setSelectedId(queueItem.id);
+  }
+
+  function undoFromQueue(id: string) {
+    const it = items.find(x => x.id === id);
+    if (!it) return;
+    setItems(prev => prev.filter(x => x.id !== id));
+    setUnsorted(prev => [{ id: it.id, path: it.path, blob: it.blob }, ...prev]);
+  }
+
+  function skipUnsorted(id: string) {
+    setUnsorted(prev => prev.filter(u => u.id !== id));
+  }
+
+  async function autoSortAll() {
+    const todo = [...unsorted];
+    for (const u of todo) {
+      const k = await suggestKind(u.path, u.blob);
+      commitToQueue(u, k);
     }
   }
 
-  function downloadResult() {
-    if (!resultUrl) return;
-    fetch(resultUrl).then(r => r.blob()).then(b => saveAs(b, resultName));
+  async function processItem(it: QueueItem) {
+    const signal = abortRef.current?.signal;
+    try {
+      updateItem(it.id, { status: "extracting", message: "Извлечение содержимого…", progress: null });
+      const extracted = await extractAny(it.blob, it.path.split("/").pop() || it.path,
+        (p, t) => updateItem(it.id, { progress: { done: p, total: t } }));
+      if (signal?.aborted) throw new Error("aborted");
+
+      updateItem(it.id, {
+        status: "translating",
+        message: `Перевод (${it.kind === "presentation" ? "презентация" : "документ"})…`,
+        progress: { done: 0, total: extracted.pages.length },
+      });
+
+      const opts = {
+        apiKey, model, visionCapable, signal,
+        onLog: (m: string) => updateItem(it.id, { message: m }),
+        onProgress: (d: number, t: number) => updateItem(it.id, { progress: { done: d, total: t } }),
+      };
+
+      if (it.kind === "presentation") {
+        const slides = await planSlides(extracted, opts);
+        if (signal?.aborted) throw new Error("aborted");
+        updateItem(it.id, { status: "building", message: "Сборка PPTX…", slides });
+        const blob = await buildPptx(slides);
+        const name = (it.path.replace(/\.[^./]+$/, "").split("/").pop() || "result") + "_MIET_ru.pptx";
+        updateItem(it.id, { status: "done", message: `Готово: ${name}`, resultBlob: blob, resultName: name, progress: null });
+      } else {
+        const doc = await planDoc(extracted, opts);
+        if (signal?.aborted) throw new Error("aborted");
+        updateItem(it.id, { status: "building", message: "Сборка DOCX…", doc });
+        const blob = await buildDocx(doc);
+        const name = (it.path.replace(/\.[^./]+$/, "").split("/").pop() || "result") + "_ru.docx";
+        updateItem(it.id, { status: "done", message: `Готово: ${name}`, resultBlob: blob, resultName: name, progress: null });
+      }
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (msg === "aborted") {
+        updateItem(it.id, { status: "queued", message: "Отменено", progress: null });
+      } else {
+        console.error(e);
+        updateItem(it.id, { status: "error", error: msg, message: `Ошибка: ${msg}`, progress: null });
+      }
+    }
   }
 
+  async function runAll() {
+    if (running) return;
+    abortRef.current = new AbortController();
+    setRunning(true);
+    try {
+      const queue = items.filter(it => it.status === "queued" || it.status === "error");
+      for (const it of queue) {
+        if (abortRef.current?.signal.aborted) break;
+        await processItem(it);
+      }
+    } finally {
+      setRunning(false);
+      abortRef.current = null;
+    }
+  }
+
+  function cancelAll() {
+    abortRef.current?.abort();
+  }
+
+  function clearAll() {
+    if (running) return;
+    setItems([]); setUnsorted([]); setSelectedId(null);
+  }
+
+  async function downloadAll() {
+    const done = items.filter(it => it.status === "done" && it.resultBlob && it.resultName);
+    if (done.length === 0) return;
+    if (done.length === 1) { saveAs(done[0].resultBlob!, done[0].resultName!); return; }
+    const zip = new JSZip();
+    for (const it of done) zip.file(it.resultName!, it.resultBlob!);
+    const blob = await zip.generateAsync({ type: "blob" });
+    saveAs(blob, "miet-translator-results.zip");
+  }
+
+  function downloadOne(it: QueueItem) {
+    if (it.resultBlob && it.resultName) saveAs(it.resultBlob, it.resultName);
+  }
+
+  function removeItem(id: string) {
+    setItems(prev => prev.filter(it => it.id !== id));
+    if (selectedId === id) setSelectedId(null);
+  }
+
+  function changeKind(id: string, kind: Kind) {
+    updateItem(id, { kind });
+  }
+
+  // Drag-drop on body
+  const dropRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = dropRef.current;
+    if (!el) return;
+    const onDragOver = (e: DragEvent) => { e.preventDefault(); el.classList.add("drag-over"); };
+    const onDragLeave = () => el.classList.remove("drag-over");
+    const onDrop = (e: DragEvent) => {
+      e.preventDefault();
+      el.classList.remove("drag-over");
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const items = Array.from(dt.items || []);
+      const entries = items.map(it => it.webkitGetAsEntry?.()).filter(Boolean) as FileSystemEntry[];
+      if (entries.length > 0 && entries.some(en => en.isDirectory)) {
+        readEntries(entries).then(files => handleFiles(files));
+      } else {
+        handleFiles(dt.files);
+      }
+    };
+    el.addEventListener("dragover", onDragOver);
+    el.addEventListener("dragleave", onDragLeave);
+    el.addEventListener("drop", onDrop);
+    return () => {
+      el.removeEventListener("dragover", onDragOver);
+      el.removeEventListener("dragleave", onDragLeave);
+      el.removeEventListener("drop", onDrop);
+    };
+  }, []);
+
+  const selected = items.find(it => it.id === selectedId) || null;
+  const totalQueued = items.filter(i => i.status === "queued" || i.status === "error").length;
+
   return (
-    <div className="page">
-      <header>
+    <div className="app">
+      <header className="topbar">
         <h1>MIET Translator</h1>
-        <p className="muted">Перевод и конвертация презентаций / документов в шаблон МИЭТ. Всё в браузере, без бэкенда.</p>
+        <button className="ghost" onClick={() => setShowSettings(s => !s)}>
+          {showSettings ? "Скрыть настройки" : "Настройки"}
+        </button>
       </header>
 
-      <section className="card">
-        <h2>1. OpenRouter</h2>
-        <label>
-          API key{" "}
-          <input
-            type="password" value={apiKey} onChange={e => setApiKey(e.target.value)}
-            placeholder="sk-or-v1-…" autoComplete="off" spellCheck={false}
-          />
-        </label>
-        <label>
-          Модель{" "}
-          <select value={model} onChange={e => setModel(e.target.value)}>
-            {FREE_MODELS.map(m => (
-              <option key={m.id} value={m.id}>{m.label}</option>
-            ))}
-          </select>
-        </label>
-        <p className="muted small">
-          Получить ключ:{" "}
-          <a href="https://openrouter.ai/settings/keys" target="_blank" rel="noreferrer">openrouter.ai/settings/keys</a>
-          {" — "} ключ хранится только в твоём localStorage.
-        </p>
-      </section>
-
-      <section className="card">
-        <h2>2. Что переводим</h2>
-        <div className="row">
+      {showSettings && (
+        <section className="settings">
+          <p className="muted small">Используется встроенный ключ. Можно вставить свой — он сохранится в этом браузере.</p>
           <label>
-            <input type="radio" name="mode" checked={mode === "presentation"} onChange={() => setMode("presentation")} />
-            Презентация → MIET PPTX
+            Свой OpenRouter ключ{" "}
+            <input type="password" value={overrideKey} onChange={e => setOverrideKey(e.target.value)}
+              placeholder={usingDefaultKey ? "(встроенный активен)" : ""} autoComplete="off" spellCheck={false} />
           </label>
           <label>
-            <input type="radio" name="mode" checked={mode === "document"} onChange={() => setMode("document")} />
-            Документ / PDF → DOCX
+            Модель{" "}
+            <select value={model} onChange={e => setModel(e.target.value)}>
+              {FREE_MODELS.map(m => (<option key={m.id} value={m.id}>{m.label}</option>))}
+            </select>
           </label>
-        </div>
-        <label>
-          Целевой язык{" "}
-          <select value={lang} onChange={e => setLang(e.target.value as TargetLang)}>
-            <option value="ru">Русский</option>
-            <option value="en">English</option>
-          </select>
-        </label>
-      </section>
+        </section>
+      )}
 
-      <section className="card">
-        <h2>3. Файл</h2>
-        <input type="file" accept=".pdf" onChange={e => setFile(e.target.files?.[0] ?? null)} />
-        {file && <p className="muted small">{file.name} · {(file.size / 1024 / 1024).toFixed(2)} MB</p>}
-      </section>
-
-      <section className="card">
-        <button className="primary" disabled={busy} onClick={run}>
-          {busy ? "Обрабатывается…" : "Запустить"}
-        </button>
-        {progress && (
-          <div className="progress">
-            <div className="bar" style={{ width: `${(progress.done / Math.max(progress.total, 1)) * 100}%` }} />
-            <span className="small">{progress.done}/{progress.total}</span>
+      <div className="main">
+        <aside className="sidebar">
+          <div className="dropzone" ref={dropRef}>
+            <p>Брось <b>файлы</b>, <b>папку</b> или <b>.zip / .rar / .7z</b></p>
+            <p className="muted small">PDF · PPTX · DOCX · картинки · txt</p>
+            <div className="dropzone-actions">
+              <label className="ghost">
+                Файлы…
+                <input type="file" multiple accept=".pdf,.pptx,.docx,.png,.jpg,.jpeg,.webp,.gif,.bmp,.txt,.md,.zip,.rar,.7z,.tar,.gz,.tgz"
+                  onChange={e => e.target.files && handleFiles(e.target.files)} hidden />
+              </label>
+              <label className="ghost">
+                Папка…
+                <input type="file" {...{ webkitdirectory: "" } as React.InputHTMLAttributes<HTMLInputElement>}
+                  onChange={e => e.target.files && handleFiles(e.target.files)} hidden />
+              </label>
+            </div>
           </div>
-        )}
-        {resultUrl && (
-          <p>
-            <button className="primary" onClick={downloadResult}>Скачать «{resultName}»</button>
-          </p>
-        )}
-        {logs.length > 0 && (
-          <pre className="log">{logs.join("\n")}</pre>
-        )}
-      </section>
 
-      <footer className="muted small">
-        <p>Перенос графиков из PDF: рендер каждой страницы как картинка → вставка в макет «Заголовок и картинка». Для пиксель-в-пиксель переноса лучше скармливать исходные .pptx.</p>
-        <p>Бесплатные модели OpenRouter имеют rate-limit (~20 req/min, 50 req/day без $10 баланса). Тулза автоматически делает retry с задержкой.</p>
-      </footer>
+          <div className="queue-controls">
+            <button className="primary" onClick={runAll} disabled={running || totalQueued === 0}>
+              {running ? "Обработка…" : `Запустить (${totalQueued})`}
+            </button>
+            {running && <button className="ghost" onClick={cancelAll}>Стоп</button>}
+            <button className="ghost" onClick={downloadAll} disabled={!items.some(i => i.status === "done")}>
+              ⬇ Скачать всё
+            </button>
+            <button className="ghost" onClick={clearAll} disabled={running}>Очистить</button>
+          </div>
+
+          <ul className="queue">
+            {items.map(it => (
+              <li key={it.id}
+                  className={`q-item q-${it.status} ${selectedId === it.id ? "selected" : ""}`}
+                  onClick={() => setSelectedId(it.id)}>
+                <div className="q-top">
+                  <span className="q-name" title={it.path}>{it.path.split("/").pop()}</span>
+                  <select className={`q-kind kind-${it.kind}`} value={it.kind}
+                          onClick={e => e.stopPropagation()}
+                          onChange={e => changeKind(it.id, e.target.value as Kind)}>
+                    <option value="presentation">PPT</option>
+                    <option value="document">DOC</option>
+                  </select>
+                  <button className="q-remove" title="удалить" onClick={e => { e.stopPropagation(); removeItem(it.id); }}>×</button>
+                </div>
+                <div className="q-status">{it.message ?? statusLabel(it.status)}</div>
+                {it.progress && (
+                  <div className="progress small">
+                    <div className="bar" style={{ width: `${(it.progress.done / Math.max(it.progress.total, 1)) * 100}%` }} />
+                  </div>
+                )}
+                {it.status === "done" && (
+                  <button className="ghost q-download" onClick={e => { e.stopPropagation(); downloadOne(it); }}>
+                    ⬇ {it.resultName}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </aside>
+
+        <section className="viewer">
+          {unsorted.length > 0 ? (
+            <SwipeDeck
+              items={unsorted}
+              onDecide={(id, kind) => {
+                const u = unsorted.find(x => x.id === id);
+                if (u) commitToQueue(u, kind);
+              }}
+              onUndo={(id) => undoFromQueue(id)}
+              onAutoSortAll={autoSortAll}
+              onSkip={skipUnsorted}
+            />
+          ) : !selected ? (
+            <div className="empty">
+              <p>Выбери файл слева, чтобы увидеть оригинал и результат рядом.</p>
+            </div>
+          ) : (
+            <div className="side-by-side">
+              <div className="pane">
+                <div className="pane-header">Оригинал · {selected.path.split("/").pop()}</div>
+                <OriginalPreview blob={selected.blob} path={selected.path} />
+              </div>
+              <div className="pane">
+                <div className="pane-header">
+                  Результат · {selected.kind === "presentation" ? "PPTX (MIET)" : "DOCX"}
+                </div>
+                {selected.slides ? <SlidesPreview slides={selected.slides} />
+                  : selected.doc ? <DocPreview doc={selected.doc} />
+                  : <div className="preview-pane empty">{selected.message || "Ещё не обработано"}</div>}
+              </div>
+            </div>
+          )}
+        </section>
+      </div>
     </div>
   );
+}
+
+function OriginalPreview({ blob, path }: { blob: Blob; path: string }) {
+  const ext = path.toLowerCase().split(".").pop();
+  if (ext === "pdf") return <PdfPreview blob={blob} />;
+  if (ext === "png" || ext === "jpg" || ext === "jpeg" || ext === "webp" || ext === "gif" || ext === "bmp") {
+    return <ImageOnly blob={blob} />;
+  }
+  return <RawTextPreview blob={blob} path={path} />;
+}
+
+function ImageOnly({ blob }: { blob: Blob }) {
+  const [url, setUrl] = useState("");
+  useEffect(() => {
+    const u = URL.createObjectURL(blob);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [blob]);
+  return <div className="preview-pane"><img src={url} alt="" style={{ maxWidth: "100%" }} /></div>;
+}
+
+function RawTextPreview({ blob, path }: { blob: Blob; path: string }) {
+  const [text, setText] = useState("Загрузка…");
+  useEffect(() => {
+    (async () => {
+      const ext = path.toLowerCase().split(".").pop();
+      try {
+        if (ext === "docx") {
+          const m = await import("mammoth/mammoth.browser.js");
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const r = await (m as any).extractRawText({ arrayBuffer: await blob.arrayBuffer() });
+          setText(r.value || "(пусто)");
+        } else if (ext === "pptx") {
+          const JSZipMod = (await import("jszip")).default;
+          const zip = await JSZipMod.loadAsync(await blob.arrayBuffer());
+          const slides = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort();
+          const out: string[] = [];
+          for (let i = 0; i < slides.length; i++) {
+            const xml = await zip.files[slides[i]].async("string");
+            const txt: string[] = [];
+            const re = /<a:t[^>]*>([\s\S]*?)<\/a:t>/g;
+            let m: RegExpExecArray | null;
+            while ((m = re.exec(xml))) txt.push(m[1]);
+            out.push(`--- Слайд ${i + 1} ---\n` + txt.join("\n"));
+          }
+          setText(out.join("\n\n"));
+        } else {
+          setText(await blob.text());
+        }
+      } catch (e) {
+        setText("Не удалось прочитать: " + (e as Error).message);
+      }
+    })();
+  }, [blob, path]);
+  return <div className="preview-pane"><pre className="raw-text">{text}</pre></div>;
+}
+
+function statusLabel(s: QueueItem["status"]): string {
+  switch (s) {
+    case "queued": return "В очереди";
+    case "extracting": return "Чтение…";
+    case "translating": return "Перевод…";
+    case "building": return "Сборка…";
+    case "done": return "Готово";
+    case "error": return "Ошибка";
+  }
+}
+
+async function readEntries(entries: FileSystemEntry[]): Promise<File[]> {
+  const out: File[] = [];
+  async function walk(entry: FileSystemEntry, prefix: string) {
+    if (entry.isFile) {
+      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
+      Object.defineProperty(file, "webkitRelativePath", { value: prefix + entry.name, configurable: true });
+      out.push(file);
+    } else if (entry.isDirectory) {
+      const reader = (entry as FileSystemDirectoryEntry).createReader();
+      const children: FileSystemEntry[] = await new Promise((res, rej) => reader.readEntries(res, rej));
+      for (const c of children) await walk(c, prefix + entry.name + "/");
+    }
+  }
+  for (const e of entries) await walk(e, "");
+  return out;
 }
