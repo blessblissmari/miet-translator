@@ -20,11 +20,18 @@ export async function extractPdf(
 
   for (let i = 1; i <= doc.numPages; i++) {
     const page = await doc.getPage(i);
-    const viewport = page.getViewport({ scale: renderScale });
     const baseViewport = page.getViewport({ scale: 1 });
     const pageH = baseViewport.height;
 
-    // Render full page → fallback PNG
+    // Probe text first to decide render scale (sparse text → likely scan/handwriting → render hi-res)
+    const tc = await page.getTextContent();
+    const items = tc.items as TextItem[];
+    const probedText = items.map(it => it.str).join("").trim();
+    const isSparse = probedText.length < 30;
+    const scale = isSparse ? Math.max(2.5, renderScale) : renderScale;
+    const viewport = page.getViewport({ scale });
+
+    // Render full page → fallback PNG (hi-res for vision OCR if sparse)
     const canvas = document.createElement("canvas");
     canvas.width = Math.ceil(viewport.width);
     canvas.height = Math.ceil(viewport.height);
@@ -32,11 +39,10 @@ export async function extractPdf(
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     await page.render({ canvasContext: ctx, viewport, canvas }).promise;
-    const imageDataUrl = canvas.toDataURL("image/png");
-
-    // Text content with positions
-    const tc = await page.getTextContent();
-    const items = tc.items as TextItem[];
+    // Use JPEG with quality for sparse pages so the data URL stays under request limits
+    const imageDataUrl = isSparse
+      ? canvas.toDataURL("image/jpeg", 0.85)
+      : canvas.toDataURL("image/png");
     const lines: Array<{ text: string; x: number; y: number; w: number; h: number; fontSize: number }> = [];
     // PDF y is from bottom; convert to top-origin so it's intuitive
     const grouped: Array<{ y: number; items: TextItem[] }> = [];

@@ -74,12 +74,30 @@ async function translateDocPage(
   page: { text: string; imageDataUrl: string; index: number; images?: { dataUrl: string; y: number; w: number; h: number }[] },
   opts: PlannerOpts,
 ): Promise<DocBlock[]> {
-  const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
-    { type: "text", text: `Translate the following page (page ${page.index + 1}) into ${TARGET_LANG}. Use Markdown as instructed.\n\n${page.text.slice(0, 12000)}` },
-  ];
-  if (opts.visionCapable && page.imageDataUrl) {
-    userContent.push({ type: "image_url", image_url: { url: page.imageDataUrl } });
+  const isHandwritten = page.text.replace(/\s+/g, "").length < 30;
+
+  if (isHandwritten && !opts.visionCapable) {
+    throw new Error(
+      `Страница ${page.index + 1} без текстового слоя (рукопись/скан). Переключи модель на vision-капабельную (Gemma 3 27B / 12B) в Настройках.`
+    );
   }
+
+  const sysPrompt = isHandwritten
+    ? VISION_OCR_PROMPT(TARGET_LANG)
+    : DOC_TRANSLATE_PROMPT(TARGET_LANG);
+
+  const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = isHandwritten
+    ? [
+        { type: "text", text: `Page ${page.index + 1}. The page may contain handwriting, sketches, or scanned printed text. Carefully transcribe everything you can see, then translate to ${TARGET_LANG} as Markdown per the rules.` },
+        { type: "image_url", image_url: { url: page.imageDataUrl } },
+      ]
+    : [
+        { type: "text", text: `Translate the following page (page ${page.index + 1}) into ${TARGET_LANG}. Use Markdown as instructed.\n\n${page.text.slice(0, 12000)}` },
+        ...(opts.visionCapable && page.imageDataUrl ? [{ type: "image_url" as const, image_url: { url: page.imageDataUrl } }] : []),
+      ];
+
+  if (isHandwritten) opts.onLog?.(`Стр. ${page.index + 1}: режим vision-OCR (рукопись/скан)`);
+
   const out = await chat({
     apiKey: opts.apiKey,
     model: opts.model,
@@ -87,12 +105,27 @@ async function translateDocPage(
     maxTokens: 4096,
     signal: opts.signal,
     messages: [
-      { role: "system", content: DOC_TRANSLATE_PROMPT(TARGET_LANG) },
+      { role: "system", content: sysPrompt },
       { role: "user", content: userContent },
     ],
   });
   return parseMarkdownToBlocks(stripCodeFences(out));
 }
+
+const VISION_OCR_PROMPT = (lang: string) => `You are a senior technical translator and OCR expert for academic notes, including HANDWRITTEN material.
+
+Task: look at the attached image of a page (it may be handwritten lecture notes, a scanned printed page, or a photo of someone's notebook). Carefully read the contents — including handwriting, formulas, sketches, and any printed text. Then translate everything into ${lang} ("русский") in academic МИЭТ-style.
+
+CRITICAL rules:
+- Output ONLY translated Markdown. No commentary. No code fences.
+- Read the page exhaustively. Do NOT skip handwritten margin notes, sub-questions, or formulas.
+- For mathematical content, use LaTeX in $...$ (inline) and $$...$$ (display). Reproduce subscripts, superscripts, fractions, integrals, sums faithfully.
+- Use Markdown structure: # for top heading, ##/### for sections, "- item" for bullets, "1." for ordered lists.
+- For diagrams/sketches, leave a short marker like "(см. рис. на стр. {N})" so the picture can be inserted later.
+- If you cannot read part of the page (smudged, cut off), write "[нечитаемо]" inline — do NOT invent content.
+- Use formal Russian academic terminology (Задача, Решение, Часть, Найдите, Покажите, что …).
+- Do NOT translate identifiers, units, code, or proper names (BJT, MOSFET, V_T, …).
+`;
 
 export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Promise<SlidePlan[]> {
   const plans: SlidePlan[] = [];
@@ -116,6 +149,32 @@ async function planSlideRobust(
   const bestImg = realImages.length > 0
     ? realImages.slice().sort((a, b) => (b.w * b.h) - (a.w * a.h))[0].dataUrl
     : null;
+
+  const isHandwritten = page.text.replace(/\s+/g, "").length < 30;
+  if (isHandwritten && !opts.visionCapable) {
+    throw new Error(
+      `Слайд ${page.index + 1} без текста (скан/рукопись). Переключи модель на vision (Gemma 3 27B/12B).`
+    );
+  }
+  if (isHandwritten) {
+    opts.onLog?.(`Слайд ${page.index + 1}: режим vision-OCR`);
+    // For handwritten slides, get a translation directly from the image.
+    const out = await chat({
+      apiKey: opts.apiKey,
+      model: opts.model,
+      temperature: 0.2,
+      maxTokens: 1024,
+      signal: opts.signal,
+      messages: [
+        { role: "system", content: `Read the attached slide image (may be handwritten or scanned), then output a short ${TARGET_LANG} title on the first line, then up to 8 bullet lines starting with "- ". Keep math in $...$ or $$...$$. Output only Markdown.` },
+        { role: "user", content: [
+          { type: "text", text: `Slide ${page.index + 1} — read & translate.` },
+          { type: "image_url", image_url: { url: page.imageDataUrl } },
+        ] },
+      ],
+    });
+    return parseSlideFromPlain(stripCodeFences(out), bestImg);
+  }
 
   // Primary: structured JSON
   try {
