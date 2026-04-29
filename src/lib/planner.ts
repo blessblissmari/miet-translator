@@ -1,16 +1,16 @@
 import { chat, parseJsonLoose } from "./openrouter";
-import type { SlidePlan, DocPlan, ExtractedDoc, TargetLang } from "./types";
-
-const LANG_NAME: Record<TargetLang, string> = { ru: "Russian", en: "English" };
+import type { SlidePlan, DocPlan, ExtractedDoc } from "./types";
 
 export interface PlannerOpts {
   apiKey: string;
   model: string;
   visionCapable: boolean;
-  targetLang: TargetLang;
   onLog?: (msg: string) => void;
   onProgress?: (done: number, total: number) => void;
+  signal?: AbortSignal;
 }
+
+const TARGET_LANG = "Russian";
 
 const SLIDE_LAYOUTS = [
   "section-title",
@@ -56,7 +56,6 @@ Rules:
 async function planSlide(
   pageText: string,
   pageImage: string,
-  lang: string,
   opts: PlannerOpts,
 ): Promise<SlidePlan> {
   const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
@@ -70,8 +69,9 @@ async function planSlide(
     temperature: 0.2,
     maxTokens: 2048,
     responseJson: true,
+    signal: opts.signal,
     messages: [
-      { role: "system", content: SLIDE_PROMPT(lang, SLIDE_LAYOUTS.map(l => `"${l}"`).join(", ")) },
+      { role: "system", content: SLIDE_PROMPT(TARGET_LANG, SLIDE_LAYOUTS.map(l => `"${l}"`).join(", ")) },
       { role: "user", content: userContent },
     ],
   });
@@ -89,13 +89,12 @@ async function planSlide(
 }
 
 export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Promise<SlidePlan[]> {
-  const lang = LANG_NAME[opts.targetLang];
   const plans: SlidePlan[] = [];
   for (let i = 0; i < extracted.pages.length; i++) {
     const page = extracted.pages[i];
     opts.onLog?.(`Перевод слайда ${i + 1}/${extracted.pages.length}…`);
     try {
-      const plan = await planSlide(page.text, page.imageDataUrl, lang, opts);
+      const plan = await planSlide(page.text, page.imageDataUrl, opts);
       plans.push(plan);
     } catch (e) {
       opts.onLog?.(`Слайд ${i + 1}: ошибка LLM — оставляю исходник как картинку. (${(e as Error).message})`);
@@ -107,7 +106,6 @@ export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Pr
 }
 
 export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promise<DocPlan> {
-  const lang = LANG_NAME[opts.targetLang];
   // Process pages in batches to fit within free-tier rate limits.
   const BATCH = 4;
   const allBlocks: DocPlan["blocks"] = [];
@@ -134,8 +132,9 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
         temperature: 0.2,
         maxTokens: 4096,
         responseJson: true,
+        signal: opts.signal,
         messages: [
-          { role: "system", content: DOC_PROMPT(lang) },
+          { role: "system", content: DOC_PROMPT(TARGET_LANG) },
           { role: "user", content: userContent },
         ],
       });
@@ -151,5 +150,5 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
     opts.onProgress?.(Math.min(i + BATCH, extracted.pages.length), extracted.pages.length);
   }
 
-  return { title: title || (opts.targetLang === "ru" ? "Документ" : "Document"), blocks: allBlocks };
+  return { title: title || "Документ", blocks: allBlocks };
 }

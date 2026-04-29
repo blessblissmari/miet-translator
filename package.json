@@ -14,6 +14,7 @@
     "file-saver": "^2.0.5",
     "jszip": "^3.10.1",
     "katex": "^0.16.45",
+    "libarchive.js": "^2.0.2",
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^5.6.205",
     "pptxgenjs": "^4.0.1",
