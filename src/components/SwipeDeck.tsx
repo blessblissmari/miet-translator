@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { classifyInput } from "../lib/extractAny";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { classifyInput } from "../lib/inputKind";
 import type { IntakeFile } from "../lib/intake";
+import { loadPdfDocument } from "../lib/pdfjs";
+import { useObjectUrl } from "../lib/useObjectUrl";
 
 export type Kind = "presentation" | "document";
 
@@ -19,21 +21,22 @@ interface Props {
 
 export function SwipeDeck({ items, onDecide, onUndo, onAutoSortAll, onSkip }: Props) {
   const [history, setHistory] = useState<{ id: string; kind: Kind }[]>([]);
-  const top = items[0];
 
-  function commit(kind: Kind) {
-    if (!top) return;
-    onDecide(top.id, kind);
-    setHistory(h => [...h, { id: top.id, kind }]);
-  }
-  function undo() {
-    const last = history[history.length - 1];
-    if (!last) return;
-    onUndo(last.id);
-    setHistory(h => h.slice(0, -1));
-  }
+  const commit = useCallback((kind: Kind) => {
+    const next = items[0];
+    if (!next) return;
+    onDecide(next.id, kind);
+    setHistory(h => [...h, { id: next.id, kind }]);
+  }, [items, onDecide]);
 
-  // Keyboard: ← → ↑/↓ Backspace
+  const undo = useCallback(() => {
+    setHistory(h => {
+      const last = h[h.length - 1];
+      if (last) onUndo(last.id);
+      return last ? h.slice(0, -1) : h;
+    });
+  }, [onUndo]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === "INPUT") return;
@@ -43,7 +46,9 @@ export function SwipeDeck({ items, onDecide, onUndo, onAutoSortAll, onSkip }: Pr
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [top, history]);
+  }, [commit, undo]);
+
+  const top = items[0];
 
   return (
     <div className="deck-root">
@@ -160,9 +165,9 @@ function Card({ item, isTop, depth, onDecide, onSkip }: {
 }
 
 function CardThumb({ item }: { item: DeckItem }) {
-  const kind = useMemo(() => classifyInput(item.path), [item.path]);
+  const kind = classifyInput(item.path);
+  const url = useObjectUrl(item.blob);
   if (kind === "image") {
-    const url = useObjectUrl(item.blob);
     return <div className="card-thumb image"><img src={url} alt="" /></div>;
   }
   if (kind === "pdf") {
@@ -186,12 +191,9 @@ function PdfThumb({ blob }: { blob: Blob }) {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      let doc;
       try {
-        const pdfjsLib = await import("pdfjs-dist");
-        const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-        const buf = await blob.arrayBuffer();
-        const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+        doc = await loadPdfDocument(blob);
         const page = await doc.getPage(1);
         const viewport = page.getViewport({ scale: 1 });
         const canvas = ref.current;
@@ -204,8 +206,11 @@ function PdfThumb({ blob }: { blob: Blob }) {
         const ctx = canvas.getContext("2d")!;
         ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
         await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        page.cleanup();
       } catch (e) {
         setErr((e as Error).message || "render failed");
+      } finally {
+        await doc?.destroy().catch(() => undefined);
       }
     })();
     return () => { cancelled = true; };
@@ -213,14 +218,4 @@ function PdfThumb({ blob }: { blob: Blob }) {
   return <div className="card-thumb pdf">
     {err ? <div className="badge">PDF</div> : <canvas ref={ref} />}
   </div>;
-}
-
-function useObjectUrl(blob: Blob): string {
-  const [url, setUrl] = useState("");
-  useEffect(() => {
-    const u = URL.createObjectURL(blob);
-    setUrl(u);
-    return () => URL.revokeObjectURL(u);
-  }, [blob]);
-  return url;
 }

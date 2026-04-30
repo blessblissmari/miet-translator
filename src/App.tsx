@@ -1,14 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import JSZip from "jszip";
 import { saveAs } from "file-saver";
-import { planSlides, planDoc } from "./lib/planner";
-import { buildPptx } from "./lib/pptxBuild";
-import { buildDocx } from "./lib/docxBuild";
 import { FREE_MODELS, DEFAULT_MODEL, DEFAULT_API_KEY } from "./lib/openrouter";
 import { expandInputs, type IntakeFile } from "./lib/intake";
-import { extractAny, suggestKind } from "./lib/extractAny";
 import { PdfPreview, SlidesPreview, DocPreview } from "./components/Preview";
 import { SwipeDeck } from "./components/SwipeDeck";
+import { useObjectUrl } from "./lib/useObjectUrl";
 import type { SlidePlan, DocPlan } from "./lib/types";
 import "./App.css";
 
@@ -30,6 +26,10 @@ interface QueueItem {
 }
 
 interface UnsortedItem extends IntakeFile { id: string }
+
+function createId(path: string): string {
+  return `${path}_${crypto.randomUUID()}`;
+}
 
 function useLocalStorage<T extends string>(key: string, def: T): [T, (v: T) => void] {
   const [v, setV] = useState<T>(() => {
@@ -68,7 +68,7 @@ export default function App() {
     }
     const newItems: UnsortedItem[] = inputs.map(p => ({
       ...p,
-      id: `${p.path}_${Math.random().toString(36).slice(2, 7)}`,
+      id: createId(p.path),
     }));
     setUnsorted(prev => [...prev, ...newItems]);
   }
@@ -100,6 +100,7 @@ export default function App() {
 
   async function autoSortAll() {
     const todo = [...unsorted];
+    const { suggestKind } = await import("./lib/extractAny");
     for (const u of todo) {
       const k = await suggestKind(u.path, u.blob);
       commitToQueue(u, k);
@@ -110,6 +111,7 @@ export default function App() {
     const signal = abortRef.current?.signal;
     try {
       updateItem(it.id, { status: "extracting", message: "Извлечение содержимого…", progress: null });
+      const { extractAny } = await import("./lib/extractAny");
       const extracted = await extractAny(it.blob, it.path.split("/").pop() || it.path,
         (p, t) => updateItem(it.id, { progress: { done: p, total: t } }));
       if (signal?.aborted) throw new Error("aborted");
@@ -127,6 +129,10 @@ export default function App() {
       };
 
       if (it.kind === "presentation") {
+        const [{ planSlides }, { buildPptx }] = await Promise.all([
+          import("./lib/planner"),
+          import("./lib/pptxBuild"),
+        ]);
         const slides = await planSlides(extracted, opts);
         if (signal?.aborted) throw new Error("aborted");
         updateItem(it.id, { status: "building", message: "Сборка PPTX…", slides });
@@ -134,6 +140,10 @@ export default function App() {
         const name = (it.path.replace(/\.[^./]+$/, "").split("/").pop() || "result") + "_MIET_ru.pptx";
         updateItem(it.id, { status: "done", message: `Готово: ${name}`, resultBlob: blob, resultName: name, progress: null });
       } else {
+        const [{ planDoc }, { buildDocx }] = await Promise.all([
+          import("./lib/planner"),
+          import("./lib/docxBuild"),
+        ]);
         const doc = await planDoc(extracted, opts);
         if (signal?.aborted) throw new Error("aborted");
         updateItem(it.id, { status: "building", message: "Сборка DOCX…", doc });
@@ -181,6 +191,7 @@ export default function App() {
     const done = items.filter(it => it.status === "done" && it.resultBlob && it.resultName);
     if (done.length === 0) return;
     if (done.length === 1) { saveAs(done[0].resultBlob!, done[0].resultName!); return; }
+    const JSZip = (await import("jszip")).default;
     const zip = new JSZip();
     for (const it of done) zip.file(it.resultName!, it.resultBlob!);
     const blob = await zip.generateAsync({ type: "blob" });
@@ -377,12 +388,7 @@ function OriginalPreview({ blob, path }: { blob: Blob; path: string }) {
 }
 
 function ImageOnly({ blob }: { blob: Blob }) {
-  const [url, setUrl] = useState("");
-  useEffect(() => {
-    const u = URL.createObjectURL(blob);
-    setUrl(u);
-    return () => URL.revokeObjectURL(u);
-  }, [blob]);
+  const url = useObjectUrl(blob);
   return <div className="preview-pane"><img src={url} alt="" style={{ maxWidth: "100%" }} /></div>;
 }
 
@@ -393,9 +399,8 @@ function RawTextPreview({ blob, path }: { blob: Blob; path: string }) {
       const ext = path.toLowerCase().split(".").pop();
       try {
         if (ext === "docx") {
-          const m = await import("mammoth/mammoth.browser.js");
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const r = await (m as any).extractRawText({ arrayBuffer: await blob.arrayBuffer() });
+          const { extractRawText } = await import("mammoth/mammoth.browser.js");
+          const r = await extractRawText({ arrayBuffer: await blob.arrayBuffer() });
           setText(r.value || "(пусто)");
         } else if (ext === "pptx") {
           const JSZipMod = (await import("jszip")).default;

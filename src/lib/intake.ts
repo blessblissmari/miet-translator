@@ -1,5 +1,6 @@
 import JSZip from "jszip";
 import { Archive } from "libarchive.js";
+import { loadPdfDocument } from "./pdfjs";
 
 let initialized = false;
 async function ensureInit() {
@@ -90,15 +91,14 @@ function walkTree(node: unknown, prefix: string, out: IntakeFile[]) {
 /** Heuristic: does this PDF look like a presentation (slide deck) or a document? */
 export async function detectKind(blob: Blob): Promise<"presentation" | "document"> {
   // Use pdfjs to read first page dimensions
-  const pdfjsLib = await import("pdfjs-dist");
-  const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-  pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-
-  const buf = await blob.arrayBuffer();
-  const doc = await pdfjsLib.getDocument({ data: buf }).promise;
-  const page = await doc.getPage(1);
-  const vp = page.getViewport({ scale: 1 });
-  const ratio = vp.width / vp.height;
-  // Slides are landscape; documents are portrait/letter
-  return ratio > 1.2 ? "presentation" : "document";
+  const doc = await loadPdfDocument(blob);
+  try {
+    const page = await doc.getPage(1);
+    const vp = page.getViewport({ scale: 1 });
+    const ratio = vp.width / vp.height;
+    // Slides are landscape; documents are portrait/letter
+    return ratio > 1.2 ? "presentation" : "document";
+  } finally {
+    await doc.destroy().catch(() => undefined);
+  }
 }

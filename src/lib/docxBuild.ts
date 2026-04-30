@@ -37,6 +37,10 @@ async function imageDimensions(dataUrl: string): Promise<{ width: number; height
 
 interface FormulaMarker { id: string; latex: string; display: boolean; }
 
+function formulaMarkerId(index: number): string {
+  return `OMMLMARK_${index.toString(36)}_${crypto.randomUUID().replace(/-/g, "")}`;
+}
+
 /** Split a text run by $...$ (inline) and $$...$$ (display-inside-paragraph) markers and
  *  emit TextRuns interleaved with formula-marker placeholders. */
 function runsWithMath(text: string, formulas: FormulaMarker[], opts: { bold?: boolean } = {}): TextRun[] {
@@ -52,7 +56,7 @@ function runsWithMath(text: string, formulas: FormulaMarker[], opts: { bold?: bo
     }
     const isDisplay = !!m[1];
     const latex = (m[1] || m[2] || "").trim();
-    const id = `OMMLMARK_${formulas.length.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    const id = formulaMarkerId(formulas.length);
     formulas.push({ id, latex, display: isDisplay });
     out.push(new TextRun({ text: id, font: "Cambria Math" }));
     last = re.lastIndex;
@@ -124,7 +128,7 @@ async function blockToElements(block: DocBlock, formulas: FormulaMarker[]): Prom
         children: runsWithMath(it, formulas),
       }));
     case "formula": {
-      const id = `OMMLMARK_${formulas.length.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      const id = formulaMarkerId(formulas.length);
       formulas.push({ id, latex: block.latex, display: !!block.display });
       return [new Paragraph({
         alignment: block.display ? AlignmentType.CENTER : AlignmentType.LEFT,

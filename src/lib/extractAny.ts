@@ -1,23 +1,9 @@
 import JSZip from "jszip";
 import type { ExtractedDoc, ExtractedPage } from "./types";
 import { extractPdf } from "./pdfExtract";
-
-export type InputKind = "pdf" | "pptx" | "docx" | "image" | "text" | "unknown";
-
-const PDF_EXT = /\.pdf$/i;
-const PPTX_EXT = /\.pptx$/i;
-const DOCX_EXT = /\.docx$/i;
-const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)$/i;
-const TEXT_EXT = /\.(txt|md|markdown|rst)$/i;
-
-export function classifyInput(filename: string): InputKind {
-  if (PDF_EXT.test(filename)) return "pdf";
-  if (PPTX_EXT.test(filename)) return "pptx";
-  if (DOCX_EXT.test(filename)) return "docx";
-  if (IMAGE_EXT.test(filename)) return "image";
-  if (TEXT_EXT.test(filename)) return "text";
-  return "unknown";
-}
+import { loadPdfDocument } from "./pdfjs";
+export { classifyInput, type InputKind } from "./inputKind";
+import { classifyInput } from "./inputKind";
 
 /** Suggest auto kind based on input type. */
 export async function suggestKind(filename: string, blob: Blob): Promise<"presentation" | "document"> {
@@ -28,17 +14,16 @@ export async function suggestKind(filename: string, blob: Blob): Promise<"presen
   if (k === "image") return "document";
   if (k === "pdf") {
     // landscape → presentation
+    let doc;
     try {
-      const pdfjsLib = await import("pdfjs-dist");
-      const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-      const buf = await blob.arrayBuffer();
-      const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+      doc = await loadPdfDocument(blob);
       const page = await doc.getPage(1);
       const vp = page.getViewport({ scale: 1 });
       return vp.width / vp.height > 1.2 ? "presentation" : "document";
     } catch {
       return "document";
+    } finally {
+      await doc?.destroy().catch(() => undefined);
     }
   }
   return "document";
@@ -58,7 +43,7 @@ export async function extractAny(
     case "pptx": return extractPptx(blob);
     case "docx": return extractDocx(blob);
     case "image": return extractImage(blob, filename);
-    case "text":  return extractText(blob, filename);
+    case "text":  return extractText(blob);
     default:
       // try PDF parse as a last resort
       try {
@@ -87,7 +72,8 @@ async function extractPptx(blob: Blob): Promise<ExtractedDoc> {
     // Find first image in this slide via _rels
     const relsPath = slidePath.replace(/slide(\d+)\.xml$/, "_rels/slide$1.xml.rels");
     let imageDataUrl = "";
-    let width = 1280, height = 720;
+    const width = 1280;
+    const height = 720;
     if (zip.files[relsPath]) {
       const relsXml = await zip.files[relsPath].async("string");
       const m = relsXml.match(/Target="(\.\.\/media\/[^"]+)"/i);
@@ -173,7 +159,7 @@ async function extractImage(blob: Blob, filename: string): Promise<ExtractedDoc>
 }
 
 /* ─── Plain text ───────────────────────────────── */
-async function extractText(blob: Blob, _filename: string): Promise<ExtractedDoc> {
+async function extractText(blob: Blob): Promise<ExtractedDoc> {
   const text = await blob.text();
   return {
     pages: [{ index: 0, text, imageDataUrl: await renderTextToImage(text, 1024, 1400), width: 1024, height: 1400 }],

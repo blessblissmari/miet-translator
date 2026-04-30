@@ -1,8 +1,5 @@
-import * as pdfjsLib from "pdfjs-dist";
-import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import type { ExtractedDoc, ExtractedPage, ExtractedImage } from "./types";
-
-pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+import { loadPdfDocument, loadPdfJs, type PdfPageProxy } from "./pdfjs";
 
 interface TextItem { str: string; transform: number[]; height: number; width: number; }
 
@@ -12,87 +9,87 @@ export async function extractPdf(
   onProgress?: (page: number, total: number) => void,
   renderScale = 1.5,
 ): Promise<ExtractedDoc> {
-  const buf = await file.arrayBuffer();
-  const doc = await pdfjsLib.getDocument({ data: buf }).promise;
+  const doc = await loadPdfDocument(file);
   const pages: ExtractedPage[] = [];
-  const meta = await doc.getMetadata().catch(() => null);
-  const info = (meta?.info ?? {}) as { Title?: string; Author?: string };
+  try {
+    const meta = await doc.getMetadata().catch(() => null);
+    const info = (meta?.info ?? {}) as { Title?: string; Author?: string };
 
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i);
-    const baseViewport = page.getViewport({ scale: 1 });
-    const pageH = baseViewport.height;
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const pageH = baseViewport.height;
 
-    // Probe text first to decide render scale (sparse text → likely scan/handwriting → render hi-res)
-    const tc = await page.getTextContent();
-    const items = tc.items as TextItem[];
-    const probedText = items.map(it => it.str).join("").trim();
-    const isSparse = probedText.length < 30;
-    const scale = isSparse ? Math.max(2.5, renderScale) : renderScale;
-    const viewport = page.getViewport({ scale });
+      const tc = await page.getTextContent();
+      const items = tc.items as TextItem[];
+      const probedText = items.map(it => it.str).join("").trim();
+      const isSparse = probedText.length < 30;
+      const scale = isSparse ? Math.max(2.5, renderScale) : renderScale;
+      const viewport = page.getViewport({ scale });
 
-    // Render full page → fallback PNG (hi-res for vision OCR if sparse)
-    const canvas = document.createElement("canvas");
-    canvas.width = Math.ceil(viewport.width);
-    canvas.height = Math.ceil(viewport.height);
-    const ctx = canvas.getContext("2d")!;
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    // Use JPEG with quality for sparse pages so the data URL stays under request limits
-    const imageDataUrl = isSparse
-      ? canvas.toDataURL("image/jpeg", 0.85)
-      : canvas.toDataURL("image/png");
-    const lines: Array<{ text: string; x: number; y: number; w: number; h: number; fontSize: number }> = [];
-    // PDF y is from bottom; convert to top-origin so it's intuitive
-    const grouped: Array<{ y: number; items: TextItem[] }> = [];
-    const TOL = 2;
-    for (const it of items) {
-      const yBottom = it.transform[5];
-      const yTop = pageH - yBottom;
-      let bucket = grouped.find(g => Math.abs(g.y - yTop) <= TOL);
-      if (!bucket) { bucket = { y: yTop, items: [] }; grouped.push(bucket); }
-      bucket.items.push(it);
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.ceil(viewport.width);
+      canvas.height = Math.ceil(viewport.height);
+      const ctx = canvas.getContext("2d")!;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      const imageDataUrl = isSparse
+        ? canvas.toDataURL("image/jpeg", 0.85)
+        : canvas.toDataURL("image/png");
+      canvas.width = 0;
+      canvas.height = 0;
+      const lines: Array<{ text: string; x: number; y: number; w: number; h: number; fontSize: number }> = [];
+      const grouped: Array<{ y: number; items: TextItem[] }> = [];
+      const TOL = 2;
+      for (const it of items) {
+        const yBottom = it.transform[5];
+        const yTop = pageH - yBottom;
+        let bucket = grouped.find(g => Math.abs(g.y - yTop) <= TOL);
+        if (!bucket) { bucket = { y: yTop, items: [] }; grouped.push(bucket); }
+        bucket.items.push(it);
+      }
+      grouped.sort((a, b) => a.y - b.y);
+      for (const g of grouped) {
+        g.items.sort((a, b) => a.transform[4] - b.transform[4]);
+        const text = g.items.map(it => it.str).join(" ").replace(/\s+/g, " ").trim();
+        if (!text) continue;
+        const xs = g.items.map(it => it.transform[4]);
+        const xMin = Math.min(...xs);
+        const xMax = Math.max(...xs.map((x, idx) => x + g.items[idx].width));
+        const fontSize = Math.max(...g.items.map(it => it.height || 10));
+        lines.push({ text, x: xMin, y: g.y, w: xMax - xMin, h: fontSize, fontSize });
+      }
+
+      const images = await extractImages(page, pageH).catch(() => []);
+
+      pages.push({
+        index: i - 1,
+        text: lines.map(l => l.text).join("\n"),
+        imageDataUrl,
+        width: baseViewport.width,
+        height: pageH,
+        lines,
+        images,
+      });
+      page.cleanup();
+      onProgress?.(i, doc.numPages);
     }
-    grouped.sort((a, b) => a.y - b.y);
-    for (const g of grouped) {
-      g.items.sort((a, b) => a.transform[4] - b.transform[4]);
-      const text = g.items.map(it => it.str).join(" ").replace(/\s+/g, " ").trim();
-      if (!text) continue;
-      const xs = g.items.map(it => it.transform[4]);
-      const xMin = Math.min(...xs);
-      const xMax = Math.max(...xs.map((x, idx) => x + g.items[idx].width));
-      const fontSize = Math.max(...g.items.map(it => it.height || 10));
-      lines.push({ text, x: xMin, y: g.y, w: xMax - xMin, h: fontSize, fontSize });
-    }
-
-    // Embedded raster images
-    const images = await extractImages(page, pageH).catch(() => []);
-
-    pages.push({
-      index: i - 1,
-      text: lines.map(l => l.text).join("\n"),
-      imageDataUrl,
-      width: baseViewport.width,
-      height: pageH,
-      lines,
-      images,
-    });
-    onProgress?.(i, doc.numPages);
+    return { pages, meta: { title: info.Title, author: info.Author } };
+  } finally {
+    await doc.destroy().catch(() => undefined);
   }
-  return { pages, meta: { title: info.Title, author: info.Author } };
 }
 
-interface PdfPageWithObjs {
-  getOperatorList(): Promise<{ fnArray: number[]; argsArray: unknown[][] }>;
+interface PdfPageWithObjs extends PdfPageProxy {
   commonObjs: { get(name: string, cb: (obj: unknown) => void): void; has(name: string): boolean };
   objs: { get(name: string, cb: (obj: unknown) => void): void; has(name: string): boolean };
-  getViewport(opts: { scale: number }): { transform: number[] };
 }
 
 async function extractImages(page: unknown, pageH: number): Promise<ExtractedImage[]> {
   const p = page as PdfPageWithObjs;
   const ops = await p.getOperatorList();
+  const pdfjsLib = await loadPdfJs();
   const OPS = pdfjsLib.OPS as unknown as Record<string, number>;
   const PAINT_IMG = OPS.paintImageXObject ?? 85;
   const PAINT_IMG_INLINE = OPS.paintInlineImageXObject ?? 86;
@@ -130,13 +127,11 @@ async function extractImages(page: unknown, pageH: number): Promise<ExtractedIma
       const yPdf = ctm[5];
       const yTop = pageH - (yPdf + h);
 
-      let obj: unknown = null;
-      try { obj = await getObj(p, name); } catch { continue; }
+      const obj = await getObj(p, name).catch(() => null);
       if (!obj) continue;
       const oo = obj as { width?: number; height?: number };
       if ((oo.width ?? 0) < 24 || (oo.height ?? 0) < 24) continue;
-      let dataUrl: string | null = null;
-      try { dataUrl = await imageObjectToDataUrl(obj); } catch { continue; }
+      const dataUrl = await imageObjectToDataUrl(obj).catch(() => null);
       if (!dataUrl) continue;
       out.push({ dataUrl, y: yTop, w, h });
     } else if (fn === PAINT_IMG_INLINE) {
@@ -150,8 +145,7 @@ async function extractImages(page: unknown, pageH: number): Promise<ExtractedIma
       const yTop = pageH - (yPdf + h);
       const oo = img as { width?: number; height?: number };
       if ((oo.width ?? 0) < 24 || (oo.height ?? 0) < 24) continue;
-      let dataUrl: string | null = null;
-      try { dataUrl = await imageObjectToDataUrl(img); } catch { continue; }
+      const dataUrl = await imageObjectToDataUrl(img).catch(() => null);
       if (!dataUrl) continue;
       out.push({ dataUrl, y: yTop, w, h });
     }

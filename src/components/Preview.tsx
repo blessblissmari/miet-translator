@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import temml from "temml";
 import type { SlidePlan, DocPlan, DocBlock } from "../lib/types";
+import { loadPdfDocument } from "../lib/pdfjs";
 
 /* ──────────────────────────────────────────────
  * Original PDF preview (canvas pages, vertical)
@@ -10,30 +11,33 @@ export function PdfPreview({ blob }: { blob: Blob }) {
 
   useEffect(() => {
     let cancelled = false;
+    const host = ref.current;
     (async () => {
-      if (!ref.current) return;
-      ref.current.innerHTML = "";
-      const pdfjsLib = await import("pdfjs-dist");
-      const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
-      const buf = await blob.arrayBuffer();
-      const doc = await pdfjsLib.getDocument({ data: buf }).promise;
-      for (let i = 1; i <= doc.numPages; i++) {
-        if (cancelled) return;
-        const page = await doc.getPage(i);
-        const viewport = page.getViewport({ scale: 1 });
-        const canvas = document.createElement("canvas");
-        const targetW = 360;
-        const scale = targetW / viewport.width;
-        const vp = page.getViewport({ scale });
-        canvas.width = vp.width;
-        canvas.height = vp.height;
-        canvas.className = "pdf-page";
-        const ctx = canvas.getContext("2d")!;
-        ctx.fillStyle = "#fff";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        await page.render({ canvasContext: ctx, viewport: vp }).promise;
-        ref.current.appendChild(canvas);
+      if (!host) return;
+      host.replaceChildren();
+      const doc = await loadPdfDocument(blob);
+      try {
+        for (let i = 1; i <= doc.numPages; i++) {
+          if (cancelled) return;
+          const page = await doc.getPage(i);
+          const viewport = page.getViewport({ scale: 1 });
+          const canvas = document.createElement("canvas");
+          const targetW = 360;
+          const scale = targetW / viewport.width;
+          const vp = page.getViewport({ scale });
+          canvas.width = vp.width;
+          canvas.height = vp.height;
+          canvas.className = "pdf-page";
+          const ctx = canvas.getContext("2d")!;
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          await page.render({ canvasContext: ctx, viewport: vp }).promise;
+          if (cancelled) return;
+          host.appendChild(canvas);
+          page.cleanup();
+        }
+      } finally {
+        await doc.destroy().catch(() => undefined);
       }
     })().catch(console.error);
     return () => { cancelled = true; };

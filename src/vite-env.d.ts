@@ -17,8 +17,7 @@ declare module "temml" {
     strict?: boolean;
     [k: string]: unknown;
   }
-  function renderToString(latex: string, options?: TemmlOptions): string;
-  const _default: { renderToString: typeof renderToString };
+  const _default: { renderToString: (latex: string, options?: TemmlOptions) => string };
   export default _default;
 }
 
