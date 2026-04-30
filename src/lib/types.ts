@@ -52,7 +52,7 @@ export type DocBlock =
   | { type: "table"; rows: string[][]; header?: boolean };
 
 export interface DocPlan {
-  title: string;
+  title?: string;
   blocks: DocBlock[];
 }
 
