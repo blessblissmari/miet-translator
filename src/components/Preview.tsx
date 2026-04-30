@@ -42,6 +42,10 @@ export function PdfPreview({ blob }: { blob: Blob }) {
   return <div className="preview-pane" ref={ref} />;
 }
 
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 /* ──────────────────────────────────────────────
  * Generated PPTX preview — render SlidePlan as HTML slides
  * ────────────────────────────────────────────── */
@@ -94,8 +98,8 @@ function InlineMath({ text }: { text: string }) {
   return <>{parts.map((p, i) => {
     if (p.kind === "text") return <span key={i}>{p.value}</span>;
     let html: string;
-    try { html = temml.renderToString(p.value, { displayMode: p.kind === "display", throwOnError: false }); }
-    catch { html = `<code>${p.value}</code>`; }
+    try { html = temml.renderToString(p.value, { displayMode: p.kind === "display", throwOnError: true }); }
+    catch { html = `<code class="formula-fallback">${escapeHtml(p.value)}</code>`; }
     const Tag = p.kind === "display" ? "div" : "span";
     return <Tag key={i} className={p.kind === "display" ? "formula-display" : "formula-inline"} dangerouslySetInnerHTML={{ __html: html }} />;
   })}</>;
@@ -143,9 +147,9 @@ function DocBlockEl({ block }: { block: DocBlock }) {
     case "formula": {
       let html: string;
       try {
-        html = temml.renderToString(block.latex, { displayMode: !!block.display, throwOnError: false });
+        html = temml.renderToString(block.latex, { displayMode: !!block.display, throwOnError: true });
       } catch {
-        html = `<code>${block.latex}</code>`;
+        html = `<code class="formula-fallback">${escapeHtml(block.latex)}</code>`;
       }
       const Tag = block.display ? "div" : "span";
       return <Tag className={block.display ? "formula-display" : "formula-inline"} dangerouslySetInnerHTML={{ __html: html }} />;

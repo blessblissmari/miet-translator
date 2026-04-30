@@ -1,4 +1,5 @@
 import { chat, parseJsonLoose } from "./openrouter";
+import { normalizeMath } from "./mathNormalize";
 import type { SlidePlan, DocPlan, DocBlock, ExtractedDoc } from "./types";
 
 export interface PlannerOpts {
@@ -66,8 +67,10 @@ STRUCTURE rules:
   - "- item" for unordered lists, "1. item" for ordered lists.
   - Plain paragraphs for prose.
 - Preserve numbering of problems and sub-questions exactly.
-- If the page mentions a figure that you cannot reproduce in text, leave a short marker "(см. рис. на стр. ${"{N}"})".
+- If the page mentions a figure that you cannot reproduce in text, mention it AT MOST ONCE with a short marker "(см. рис.)". Do NOT repeat the same marker multiple times in a row.
 - For tables: render as Markdown tables with | separators. The downstream pipeline will rebuild them as native DOCX tables.
+- Use ONLY the dollar-sign math delimiters: $...$ for inline and $$...$$ for display equations. Do NOT use \\( \\) or \\[ \\]. Multi-line environments like \\begin{cases} ... \\end{cases} MUST be wrapped in $$ ... $$.
+- Do NOT prepend the document with a generic heading like "# Документ" or "# Domácí úkol". Only emit a heading if the page itself shows one.
 `;
 
 async function translateDocPage(
@@ -109,7 +112,7 @@ async function translateDocPage(
       { role: "user", content: userContent },
     ],
   });
-  return parseMarkdownToBlocks(stripCodeFences(out));
+  return parseMarkdownToBlocks(normalizeMath(stripCodeFences(out)));
 }
 
 const VISION_OCR_PROMPT = (lang: string) => `You are a senior technical translator and OCR expert for academic notes, including HANDWRITTEN material.
@@ -119,9 +122,9 @@ Task: look at the attached image of a page (it may be handwritten lecture notes,
 CRITICAL rules:
 - Output ONLY translated Markdown. No commentary. No code fences.
 - Read the page exhaustively. Do NOT skip handwritten margin notes, sub-questions, or formulas.
-- For mathematical content, use LaTeX in $...$ (inline) and $$...$$ (display). Reproduce subscripts, superscripts, fractions, integrals, sums faithfully.
+- For mathematical content, use LaTeX in $...$ (inline) and $$...$$ (display). Reproduce subscripts, superscripts, fractions, integrals, sums faithfully. Multi-line environments (cases, align, matrix) MUST be wrapped in $$ ... $$. Never use \\( \\) or \\[ \\].
 - Use Markdown structure: # for top heading, ##/### for sections, "- item" for bullets, "1." for ordered lists.
-- For diagrams/sketches, leave a short marker like "(см. рис. на стр. {N})" so the picture can be inserted later.
+- For diagrams/sketches you cannot transcribe, leave AT MOST ONE short marker "(см. рис.)" — never repeat it.
 - If you cannot read part of the page (smudged, cut off), write "[нечитаемо]" inline — do NOT invent content.
 - Use formal Russian academic terminology (Задача, Решение, Часть, Найдите, Покажите, что …).
 - Do NOT translate identifiers, units, code, or proper names (BJT, MOSFET, V_T, …).
@@ -173,7 +176,7 @@ async function planSlideRobust(
         ] },
       ],
     });
-    return parseSlideFromPlain(stripCodeFences(out), bestImg);
+    return parseSlideFromPlain(normalizeMath(stripCodeFences(out)), bestImg);
   }
 
   // Primary: structured JSON
@@ -207,8 +210,8 @@ async function planSlideRobust(
       layout = "title-text-image-right";
     }
     return {
-      title: (parsed.title || "").trim(),
-      bullets: (parsed.bullets || []).map(b => b.trim()).filter(Boolean),
+      title: normalizeMath((parsed.title || "").trim()),
+      bullets: (parsed.bullets || []).map(b => normalizeMath(b.trim())).filter(Boolean),
       layout,
       imageDataUrl: layout === "section-title" ? undefined : (bestImg ?? undefined),
     };
@@ -225,7 +228,7 @@ async function planSlideRobust(
         { role: "user", content: page.text.slice(0, 6000) },
       ],
     });
-    return parseSlideFromPlain(stripCodeFences(plain), bestImg);
+    return parseSlideFromPlain(normalizeMath(stripCodeFences(plain)), bestImg);
   }
 }
 
@@ -269,12 +272,18 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
         allBlocks.push(...blocks);
       }
       // Append extracted images (real figures from the PDF) at the end of the page block group.
-      const imgs = page.images || [];
-      for (let k = 0; k < imgs.length; k++) {
+      // Skip whole-page-sized rasters: those are scans of the page, not real figures.
+      const pageW = page.width || 1;
+      const pageH = page.height || 1;
+      const realFigs = (page.images || []).filter(im => {
+        const coverage = (im.w * im.h) / (pageW * pageH);
+        return coverage > 0 && coverage < 0.7;
+      });
+      for (let k = 0; k < realFigs.length; k++) {
         allBlocks.push({
           type: "figure",
-          imageDataUrl: imgs[k].dataUrl,
-          caption: imgs.length === 1
+          imageDataUrl: realFigs[k].dataUrl,
+          caption: realFigs.length === 1
             ? `Рис. ${i + 1}`
             : `Рис. ${i + 1}.${k + 1}`,
         });
@@ -297,7 +306,7 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
     throw new Error(`Перевод не удался ни на одной странице: ${errors[0]}`);
   }
 
-  return { title: title || "Документ", blocks: allBlocks };
+  return { title, blocks: allBlocks };
 }
 
 /** Strip ```...``` fences if a model returns them despite instructions. */
