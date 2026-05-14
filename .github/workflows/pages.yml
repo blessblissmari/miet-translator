@@ -26,6 +26,11 @@ jobs:
       - name: Build
         env:
           BASE_PATH: /${{ github.event.repository.name }}/
+          # OpenRouter API key baked into the bundle so end users
+          # (teachers) don't have to enter one. Set the
+          # OPENROUTER_API_KEY secret on the repository:
+          # Settings → Secrets and variables → Actions → New repository secret.
+          VITE_OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: npm run build
       - name: Add 404 fallback (SPA routing)
         run: cp dist/index.html dist/404.html

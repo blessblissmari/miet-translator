@@ -1,15 +1,33 @@
 import { chat, parseJsonLoose } from "./openrouter";
-import { normalizeMath } from "./mathNormalize";
+import { normalizeMath, stripCodeFences } from "./mathNormalize";
+import { visionParsePage } from "./visionParse";
+import { translateMarkdown } from "./translate";
 import type { SlidePlan, DocPlan, DocBlock, ExtractedDoc } from "./types";
 
 export interface PlannerOpts {
   apiKey: string;
   model: string;
   visionCapable: boolean;
+  /**
+   * When true, the user has explicitly marked the source as handwritten /
+   * scanned. The pipeline will then run a vision-LLM PARSE pass on every page
+   * (regardless of whether pdf.js produced a text layer), then translate the
+   * extracted Markdown in a separate text-only pass. This delivers far better
+   * results on handwritten lecture notes than treating the OCR + translation
+   * as a single LLM call. Requires a vision-capable model.
+   */
+  handwritten?: boolean;
   onLog?: (msg: string) => void;
   onProgress?: (done: number, total: number) => void;
   signal?: AbortSignal;
 }
+
+/**
+ * Threshold for auto-detecting that a PDF page's text layer is too sparse to
+ * trust (scan / handwriting / image-only PDF). Below this many
+ * non-whitespace characters we fall back to vision OCR.
+ */
+const SPARSE_TEXT_THRESHOLD = 30;
 
 const TARGET_LANG = "Russian";
 
@@ -39,96 +57,91 @@ Rules:
 - Title is a short ${lang} phrase, NOT a sentence.
 `;
 
-const DOC_TRANSLATE_PROMPT = (lang: string) => `You are a senior technical translator specializing in academic and engineering literature for Russian universities.
-
-Task: translate the academic page below into ${lang} ("русский"), with the tone and terminology used in formal Russian university coursework (МИЭТ-style).
-
-STYLE rules:
-- Use formal, academic ${lang}. Prefer established Russian technical terminology over literal/calque translations. Examples:
-  - "transistor" → «транзистор»
-  - "small-signal model" → «модель для малого сигнала»
-  - "cut-off frequency" → «частота среза»
-  - "homework" → «домашнее задание»
-  - "Question N" → «Задача N»
-  - "Solution" → «Решение»
-  - "Part (a)" → «Часть (а)» or «Пункт (а)»
-  - "Show that" → «Покажите, что»
-  - "Find" → «Найдите»
-- Do NOT translate code, identifiers, variable names, units, or proper names (Ohm, Faraday, MOSFET, etc.).
-- Preserve abbreviations: BJT, MOSFET, DC, AC, SI, etc.
-- Translate the meaning, not word-by-word. Output must read as if originally written by a Russian engineering professor.
-
-STRUCTURE rules:
-- Output ONLY the translated Markdown. No commentary. No code fences. No "Here is the translation".
-- Preserve EVERY mathematical formula. Use LaTeX inside $...$ for inline math and $$...$$ on its own line for displayed equations. NEVER omit a formula. If the page is heavy with formulas, EVERY formula must appear in the output.
-- Use Markdown structure:
-  - "# Title" for top-level title (only if the page is a cover/title page).
-  - "## Heading" / "### Subheading" for section/sub-section headings.
-  - "- item" for unordered lists, "1. item" for ordered lists.
-  - Plain paragraphs for prose.
-- Preserve numbering of problems and sub-questions exactly.
-- If the page mentions a figure that you cannot reproduce in text, mention it AT MOST ONCE with a short marker "(см. рис.)". Do NOT repeat the same marker multiple times in a row.
-- For tables: render as Markdown tables with | separators. The downstream pipeline will rebuild them as native DOCX tables.
-- Use ONLY the dollar-sign math delimiters: $...$ for inline and $$...$$ for display equations. Do NOT use \\( \\) or \\[ \\]. Multi-line environments like \\begin{cases} ... \\end{cases} MUST be wrapped in $$ ... $$.
-- Do NOT prepend the document with a generic heading like "# Документ" or "# Domácí úkol". Only emit a heading if the page itself shows one.
-`;
-
+/**
+ * Translate one document page using the two-stage Parse → Translate pipeline.
+ *
+ * Stage 1 (Parse): produce source-language Markdown for the page. If the user
+ *   marked the source as handwritten, OR the embedded text layer is too sparse
+ *   to trust, we run a vision-LLM parse on the rasterized page. Otherwise we
+ *   reuse the pdf.js text layer directly (no LLM call).
+ *
+ * Stage 2 (Translate): hand the source-language Markdown to a text-only LLM
+ *   call that translates it into academic Russian Markdown, keeping every
+ *   LaTeX formula and Markdown structure verbatim.
+ *
+ * Splitting parse from translate means a single LLM never has to do both OCR
+ * and fluent Russian rendering on one call — which was the main source of
+ * dropped formulas and garbled diagrams in the previous one-shot prompt.
+ */
 async function translateDocPage(
   page: { text: string; imageDataUrl: string; index: number; images?: { dataUrl: string; y: number; w: number; h: number }[] },
   opts: PlannerOpts,
 ): Promise<DocBlock[]> {
-  const isHandwritten = page.text.replace(/\s+/g, "").length < 30;
+  const sourceMd = await parseDocPageToMarkdown(page, opts);
+  if (!sourceMd.trim()) return [];
 
-  if (isHandwritten && !opts.visionCapable) {
-    throw new Error(
-      `Страница ${page.index + 1} без текстового слоя (рукопись/скан). Переключи модель на vision-капабельную (Gemma 3 27B / 12B) в Настройках.`
-    );
-  }
-
-  const sysPrompt = isHandwritten
-    ? VISION_OCR_PROMPT(TARGET_LANG)
-    : DOC_TRANSLATE_PROMPT(TARGET_LANG);
-
-  const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = isHandwritten
-    ? [
-        { type: "text", text: `Page ${page.index + 1}. The page may contain handwriting, sketches, or scanned printed text. Carefully transcribe everything you can see, then translate to ${TARGET_LANG} as Markdown per the rules.` },
-        { type: "image_url", image_url: { url: page.imageDataUrl } },
-      ]
-    : [
-        { type: "text", text: `Translate the following page (page ${page.index + 1}) into ${TARGET_LANG}. Use Markdown as instructed.\n\n${page.text.slice(0, 12000)}` },
-        ...(opts.visionCapable && page.imageDataUrl ? [{ type: "image_url" as const, image_url: { url: page.imageDataUrl } }] : []),
-      ];
-
-  if (isHandwritten) opts.onLog?.(`Стр. ${page.index + 1}: режим vision-OCR (рукопись/скан)`);
-
-  const out = await chat({
+  const translated = await translateMarkdown(sourceMd, {
     apiKey: opts.apiKey,
     model: opts.model,
-    temperature: 0.2,
-    maxTokens: 4096,
     signal: opts.signal,
-    messages: [
-      { role: "system", content: sysPrompt },
-      { role: "user", content: userContent },
-    ],
+    tone: "academic",
   });
-  return parseMarkdownToBlocks(normalizeMath(stripCodeFences(out)));
+  return parseMarkdownToBlocks(translated);
 }
 
-const VISION_OCR_PROMPT = (lang: string) => `You are a senior technical translator and OCR expert for academic notes, including HANDWRITTEN material.
+/**
+ * Stage 1 of the pipeline: produce source-language Markdown for one page.
+ *
+ * Routes between three implementations:
+ * - vision parse (LLM) when handwritten=true OR the text layer is sparse,
+ * - pdf.js text layer (no LLM) for printed PDFs with a usable text layer,
+ * - falls back to vision parse if the text-layer path produces empty output.
+ */
+async function parseDocPageToMarkdown(
+  page: { text: string; imageDataUrl: string; index: number },
+  opts: PlannerOpts,
+): Promise<string> {
+  const textLen = page.text.replace(/\s+/g, "").length;
+  const sparseText = textLen < SPARSE_TEXT_THRESHOLD;
+  const useVisionParse = opts.handwritten === true || sparseText;
 
-Task: look at the attached image of a page (it may be handwritten lecture notes, a scanned printed page, or a photo of someone's notebook). Carefully read the contents — including handwriting, formulas, sketches, and any printed text. Then translate everything into ${lang} ("русский") in academic МИЭТ-style.
+  if (useVisionParse) {
+    if (!opts.visionCapable) {
+      const reason = opts.handwritten ? "помечена как рукопись/скан" : "без текстового слоя";
+      throw new Error(
+        `Страница ${page.index + 1} ${reason}. Переключи модель на vision-капабельную (Gemma 4 26B / Gemma 3 27B / 12B) в Настройках.`
+      );
+    }
+    opts.onLog?.(
+      `Стр. ${page.index + 1}: парсинг (vision-OCR${opts.handwritten ? ", рукопись" : ""})…`
+    );
+    const md = await visionParsePage(page.imageDataUrl, {
+      apiKey: opts.apiKey,
+      model: opts.model,
+      signal: opts.signal,
+      pageIndex: page.index,
+      hint: opts.handwritten ? "handwritten" : "scan",
+    });
+    opts.onLog?.(`Стр. ${page.index + 1}: перевод…`);
+    return md;
+  }
 
-CRITICAL rules:
-- Output ONLY translated Markdown. No commentary. No code fences.
-- Read the page exhaustively. Do NOT skip handwritten margin notes, sub-questions, or formulas.
-- For mathematical content, use LaTeX in $...$ (inline) and $$...$$ (display). Reproduce subscripts, superscripts, fractions, integrals, sums faithfully. Multi-line environments (cases, align, matrix) MUST be wrapped in $$ ... $$. Never use \\( \\) or \\[ \\].
-- Use Markdown structure: # for top heading, ##/### for sections, "- item" for bullets, "1." for ordered lists.
-- For diagrams/sketches you cannot transcribe, leave AT MOST ONE short marker "(см. рис.)" — never repeat it.
-- If you cannot read part of the page (smudged, cut off), write "[нечитаемо]" inline — do NOT invent content.
-- Use formal Russian academic terminology (Задача, Решение, Часть, Найдите, Покажите, что …).
-- Do NOT translate identifiers, units, code, or proper names (BJT, MOSFET, V_T, …).
-`;
+  opts.onLog?.(`Стр. ${page.index + 1}: перевод текстового слоя…`);
+  return textLayerToMarkdown(page.text);
+}
+
+/**
+ * Convert raw pdf.js text-layer output into Markdown-ish source. Heuristic
+ * only — we don't reconstruct headings/lists here; the translator preserves
+ * paragraph breaks and any obvious structure already present in the text.
+ */
+function textLayerToMarkdown(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .slice(0, 12000);
+}
 
 export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Promise<SlidePlan[]> {
   const plans: SlidePlan[] = [];
@@ -153,10 +166,12 @@ async function planSlideRobust(
     ? realImages.slice().sort((a, b) => (b.w * b.h) - (a.w * a.h))[0].dataUrl
     : null;
 
-  const isHandwritten = page.text.replace(/\s+/g, "").length < 30;
+  const sparseText = page.text.replace(/\s+/g, "").length < SPARSE_TEXT_THRESHOLD;
+  const isHandwritten = opts.handwritten === true || sparseText;
   if (isHandwritten && !opts.visionCapable) {
+    const reason = opts.handwritten ? "помечен как рукопись/скан" : "без текста";
     throw new Error(
-      `Слайд ${page.index + 1} без текста (скан/рукопись). Переключи модель на vision (Gemma 3 27B/12B).`
+      `Слайд ${page.index + 1} ${reason}. Переключи модель на vision-капабельную (Gemma 4 26B / Gemma 3) в Настройках.`
     );
   }
   if (isHandwritten) {
@@ -307,13 +322,6 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
   }
 
   return { title, blocks: allBlocks };
-}
-
-/** Strip ```...``` fences if a model returns them despite instructions. */
-export function stripCodeFences(s: string): string {
-  const t = s.trim();
-  const m = t.match(/^```(?:\w+)?\s*([\s\S]*?)\s*```$/);
-  return m ? m[1] : t;
 }
 
 /** Convert Markdown (with $...$ / $$...$$ math) into DocBlock[]. */

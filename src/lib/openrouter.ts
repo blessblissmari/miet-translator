@@ -1,9 +1,16 @@
 import type { OpenRouterModel } from "./types";
 
-/** No API key is embedded. Users must provide their own OpenRouter key in the
- *  UI. The key is stored in localStorage of the user's browser only — never
- *  sent to the repo or to any server other than openrouter.ai. */
-export const DEFAULT_API_KEY = "";
+/**
+ *  Default OpenRouter API key, baked in at build time via the
+ *  `VITE_OPENROUTER_API_KEY` env variable (see `.env.example` and
+ *  `.github/workflows/pages.yml`). If absent, the UI falls back to asking the
+ *  user for a key. The build-time key is the recommended path for the MIET
+ *  deployment so that end users (teachers) don't have to manage credentials.
+ *
+ *  The key is only used directly from the browser against
+ *  `https://openrouter.ai/api/v1` — it is not proxied anywhere else.
+ */
+export const DEFAULT_API_KEY = (import.meta.env.VITE_OPENROUTER_API_KEY ?? "").toString();
 
 export const FREE_MODELS: OpenRouterModel[] = [
   // Vision-capable: handles printed text, scans, and handwriting.

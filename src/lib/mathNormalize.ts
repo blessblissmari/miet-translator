@@ -1,3 +1,10 @@
+/** Strip ```...``` fences if a model returns them despite instructions. */
+export function stripCodeFences(s: string): string {
+  const t = s.trim();
+  const m = t.match(/^```(?:\w+)?\s*([\s\S]*?)\s*```$/);
+  return m ? m[1] : t;
+}
+
 /**
  * Normalize math markup in LLM output so the renderer (temml) and the DOCX
  * builder both pick up real formulas instead of leaving raw LaTeX commands
