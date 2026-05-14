@@ -27,6 +27,12 @@ interface QueueItem {
   doc?: DocPlan;
   resultBlob?: Blob;
   resultName?: string;
+  /**
+   * User marked the source as handwritten / scanned. Triggers a dedicated
+   * vision-LLM parse pass on every page before the (separate) translation
+   * step. Requires a vision-capable model.
+   */
+  handwritten?: boolean;
 }
 
 interface UnsortedItem extends IntakeFile { id: string }
@@ -122,6 +128,7 @@ export default function App() {
 
       const opts = {
         apiKey, model, visionCapable, signal,
+        handwritten: !!it.handwritten,
         onLog: (m: string) => updateItem(it.id, { message: m }),
         onProgress: (d: number, t: number) => updateItem(it.id, { progress: { done: d, total: t } }),
       };
@@ -200,6 +207,10 @@ export default function App() {
     updateItem(id, { kind });
   }
 
+  function toggleHandwritten(id: string, handwritten: boolean) {
+    updateItem(id, { handwritten });
+  }
+
   // Drag-drop on body
   const dropRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -240,7 +251,7 @@ export default function App() {
         <div className="topbar-right">
           {!hasKey && <span className="key-warning" onClick={() => setShowSettings(true)}>⚠ Нужен ключ OpenRouter</span>}
           <button className="ghost" onClick={() => setShowSettings(s => !s)}>
-            {showSettings ? "Скрыть настройки" : "Настройки"}
+            {showSettings ? "Скрыть настройки" : "Настройки…"}
           </button>
         </div>
       </header>
@@ -254,8 +265,11 @@ export default function App() {
                 placeholder="sk-or-v1-…" autoComplete="off" spellCheck={false} />
             </label>
             <p className="muted small">
-              {hasKey ? "Ключ сохранён в браузере (localStorage). Ни на GitHub, ни куда-то ещё он не уходит — только прямо в openrouter.ai."
-                     : <>Без ключа перевод работать не будет. Бесплатный ключ можно получить на <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer">openrouter.ai/keys</a>. Он хранится только в этом браузере.</>}
+              {hasKey
+                ? (DEFAULT_API_KEY && !overrideKey.trim()
+                    ? "Используется встроенный ключ репозитория (запекается в билд из GitHub Secret VITE_OPENROUTER_API_KEY). Поле выше — override для локальных тестов."
+                    : "Ключ сохранён в браузере (localStorage). Ни на GitHub, ни куда-то ещё он не уходит — только прямо в openrouter.ai.")
+                : <>Без ключа перевод работать не будет. Бесплатный ключ можно получить на <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer">openrouter.ai/keys</a>. Он хранится только в этом браузере.</>}
             </p>
           </div>
           <label>
@@ -313,6 +327,15 @@ export default function App() {
                   </select>
                   <button className="q-remove" title="удалить" onClick={e => { e.stopPropagation(); removeItem(it.id); }}>×</button>
                 </div>
+                <label className="q-handwritten" onClick={e => e.stopPropagation()}
+                       title={visionCapable
+                         ? "С флажком: каждая страница сначала распознаётся vision-ОСР проходом, потом переводится отдельным вызовом."
+                         : "Сначала выбери vision-капабельную модель в Настройках."}>
+                  <input type="checkbox" checked={!!it.handwritten}
+                         disabled={!visionCapable}
+                         onChange={e => toggleHandwritten(it.id, e.target.checked)} />
+                  <span>Рукопись / скан</span>
+                </label>
                 <div className="q-status">{it.message ?? statusLabel(it.status)}</div>
                 {it.progress && (
                   <div className="progress small">

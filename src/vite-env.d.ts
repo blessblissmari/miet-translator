@@ -1,5 +1,14 @@
 /// <reference types="vite/client" />
 
+interface ImportMetaEnv {
+  /** OpenRouter API key embedded at build time. See `.env.example`. */
+  readonly VITE_OPENROUTER_API_KEY?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+
 declare module "*.pptx?url" {
   const src: string;
   export default src;
