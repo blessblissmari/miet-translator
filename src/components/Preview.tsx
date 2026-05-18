@@ -13,9 +13,7 @@ export function PdfPreview({ blob }: { blob: Blob }) {
     (async () => {
       if (!ref.current) return;
       ref.current.innerHTML = "";
-      const pdfjsLib = await import("pdfjs-dist");
-      const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+      const pdfjsLib = await (await import("../lib/pdfjs")).getPdfjs();
       const buf = await blob.arrayBuffer();
       const doc = await pdfjsLib.getDocument({ data: buf }).promise;
       for (let i = 1; i <= doc.numPages; i++) {
@@ -59,24 +57,43 @@ export function SlidesPreview({ slides }: { slides: SlidePlan[] }) {
 
 function SlideHTML({ slide, index }: { slide: SlidePlan; index: number }) {
   const layoutClass = `slide slide-${slide.layout}`;
+  // Mirror buildPptx exactly: section-title shows ONLY the title centered;
+  // title-image hides bullets and centers the figure full-frame.
+  if (slide.layout === "section-title") {
+    return (
+      <div className={layoutClass}>
+        <div className="slide-num">{index}</div>
+        <div className="section-title"><InlineMath text={slide.title} /></div>
+      </div>
+    );
+  }
+  if (slide.layout === "title-image") {
+    return (
+      <div className={layoutClass}>
+        <div className="slide-num">{index}</div>
+        <div className="slide-title"><InlineMath text={slide.title} /></div>
+        <div className="slide-body">
+          {slide.imageDataUrl
+            ? <img src={slide.imageDataUrl} alt={`slide ${index}`} className="slide-img" />
+            : <div className="slide-bullets">
+                {slide.bullets.map((b, i) => <div key={i} className="bullet">• <InlineMath text={b} /></div>)}
+              </div>}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className={layoutClass}>
       <div className="slide-num">{index}</div>
-      {slide.layout === "section-title" ? (
-        <div className="section-title"><InlineMath text={slide.title} /></div>
-      ) : (
-        <>
-          <div className="slide-title"><InlineMath text={slide.title} /></div>
-          <div className="slide-body">
-            <div className="slide-bullets">
-              {slide.bullets.map((b, i) => <div key={i} className="bullet">• <InlineMath text={b} /></div>)}
-            </div>
-            {slide.imageDataUrl && (
-              <img src={slide.imageDataUrl} alt={`slide ${index}`} className="slide-img" />
-            )}
-          </div>
-        </>
-      )}
+      <div className="slide-title"><InlineMath text={slide.title} /></div>
+      <div className="slide-body">
+        <div className="slide-bullets">
+          {slide.bullets.map((b, i) => <div key={i} className="bullet">• <InlineMath text={b} /></div>)}
+        </div>
+        {slide.imageDataUrl && (
+          <img src={slide.imageDataUrl} alt={`slide ${index}`} className="slide-img" />
+        )}
+      </div>
     </div>
   );
 }

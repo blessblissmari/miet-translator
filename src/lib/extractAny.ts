@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import type { ExtractedDoc, ExtractedPage } from "./types";
 import { extractPdf } from "./pdfExtract";
+import { downsampleDataUrl } from "./imageOps";
 
 export type InputKind = "pdf" | "pptx" | "docx" | "image" | "text" | "unknown";
 
@@ -29,9 +30,7 @@ export async function suggestKind(filename: string, blob: Blob): Promise<"presen
   if (k === "pdf") {
     // landscape → presentation
     try {
-      const pdfjsLib = await import("pdfjs-dist");
-      const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-      pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+      const pdfjsLib = await (await import("./pdfjs")).getPdfjs();
       const buf = await blob.arrayBuffer();
       const doc = await pdfjsLib.getDocument({ data: buf }).promise;
       const page = await doc.getPage(1);
@@ -58,7 +57,7 @@ export async function extractAny(
     case "pptx": return extractPptx(blob);
     case "docx": return extractDocx(blob);
     case "image": return extractImage(blob, filename);
-    case "text":  return extractText(blob, filename);
+    case "text":  return extractText(blob);
     default:
       // try PDF parse as a last resort
       try {
@@ -87,7 +86,8 @@ async function extractPptx(blob: Blob): Promise<ExtractedDoc> {
     // Find first image in this slide via _rels
     const relsPath = slidePath.replace(/slide(\d+)\.xml$/, "_rels/slide$1.xml.rels");
     let imageDataUrl = "";
-    let width = 1280, height = 720;
+    const width = 1280;
+    const height = 720;
     if (zip.files[relsPath]) {
       const relsXml = await zip.files[relsPath].async("string");
       const m = relsXml.match(/Target="(\.\.\/media\/[^"]+)"/i);
@@ -127,43 +127,39 @@ function decodeXmlEntities(s: string): string {
 /* ─── DOCX ─────────────────────────────────────── */
 async function extractDocx(blob: Blob): Promise<ExtractedDoc> {
   const mammoth = await import("mammoth/mammoth.browser.js");
-  const result = await (mammoth as unknown as { extractRawText: (o: { arrayBuffer: ArrayBuffer }) => Promise<{ value: string }> })
-    .extractRawText({ arrayBuffer: await blob.arrayBuffer() });
-  const text = (result.value || "").trim();
+  // Use convertToMarkdown so that headings, lists, tables, and image refs survive
+  // into the LLM input — the planner already speaks Markdown fluently.
+  const result = await mammoth.convertToMarkdown({ arrayBuffer: await blob.arrayBuffer() });
+  const md = (result.value || "").trim();
 
-  // Split into pseudo-pages by ~3000-char chunks at paragraph breaks for batched processing
+  // Block-aware chunking: never splits a $$math$$ block, table, code fence, or list.
+  const { chunkMarkdown } = await import("./markdownChunk");
+  const chunks = chunkMarkdown(md, 3500);
+
   const pages: ExtractedPage[] = [];
-  const CHUNK = 3000;
-  const paragraphs = text.split(/\n\s*\n/);
-  let buf = "";
-  let idx = 0;
-  for (const p of paragraphs) {
-    if (buf.length + p.length + 2 > CHUNK && buf) {
-      pages.push({
-        index: idx++, text: buf,
-        imageDataUrl: await renderTextToImage(buf, 1024, 1400),
-        width: 1024, height: 1400,
-      });
-      buf = "";
-    }
-    buf += (buf ? "\n\n" : "") + p;
-  }
-  if (buf) {
+  if (chunks.length === 0) {
     pages.push({
-      index: idx, text: buf,
-      imageDataUrl: await renderTextToImage(buf, 1024, 1400),
+      index: 0, text: md || "(пусто)",
+      imageDataUrl: await renderTextToImage(md, 1024, 1400),
       width: 1024, height: 1400,
     });
-  }
-  if (pages.length === 0) {
-    pages.push({ index: 0, text: text || "(пусто)", imageDataUrl: await renderTextToImage(text, 1024, 1400), width: 1024, height: 1400 });
+  } else {
+    for (let i = 0; i < chunks.length; i++) {
+      pages.push({
+        index: i, text: chunks[i],
+        imageDataUrl: await renderTextToImage(chunks[i], 1024, 1400),
+        width: 1024, height: 1400,
+      });
+    }
   }
   return { pages, meta: {} };
 }
 
 /* ─── Image ────────────────────────────────────── */
 async function extractImage(blob: Blob, filename: string): Promise<ExtractedDoc> {
-  const dataUrl = await blobToDataUrl(blob);
+  const rawDataUrl = await blobToDataUrl(blob);
+  // Downsample big phone-camera shots so vision LLM can ingest them quickly.
+  const dataUrl = await downsampleDataUrl(rawDataUrl, { maxDim: 1800 });
   const dims = await imageDims(dataUrl);
   // text = "" so that the planner triggers its vision-OCR / handwriting path.
   return {
@@ -173,7 +169,7 @@ async function extractImage(blob: Blob, filename: string): Promise<ExtractedDoc>
 }
 
 /* ─── Plain text ───────────────────────────────── */
-async function extractText(blob: Blob, _filename: string): Promise<ExtractedDoc> {
+async function extractText(blob: Blob): Promise<ExtractedDoc> {
   const text = await blob.text();
   return {
     pages: [{ index: 0, text, imageDataUrl: await renderTextToImage(text, 1024, 1400), width: 1024, height: 1400 }],

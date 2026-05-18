@@ -155,9 +155,11 @@ async function chatOnce(opts: ChatOptions): Promise<string> {
                       res.status === 403 || res.status === 404;
         const err = new OpenRouterError(res.status, rawText.slice(0, 400), fatal);
         if (fatal) throw err;
-        // Retryable (429 / 5xx)
+        // Retryable (429 / 5xx). Honor Retry-After when present (seconds or HTTP-date).
         lastErr = err;
-        const wait = Math.min(60_000, 2000 * Math.pow(2, attempt));
+        const ra = parseRetryAfter(res.headers.get("retry-after"));
+        const fallback = Math.min(60_000, 2000 * Math.pow(2, attempt));
+        const wait = ra ?? fallback;
         await sleep(wait);
         continue;
       }
@@ -192,4 +194,70 @@ export function parseJsonLoose<T>(raw: string): T {
   const last = s.lastIndexOf("}");
   if (first >= 0 && last > first) s = s.slice(first, last + 1);
   return JSON.parse(s) as T;
+}
+
+
+
+/**
+ * Parse a Retry-After header into milliseconds. Header may be:
+ *   - a delay in seconds: "30"
+ *   - an HTTP-date: "Wed, 21 Oct 2026 07:28:00 GMT"
+ * Returns null on parse failure or unreasonable values (>5 min, treat as 5 min).
+ */
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const trimmed = header.trim();
+  if (/^\d+$/.test(trimmed)) {
+    const sec = parseInt(trimmed, 10);
+    if (!Number.isFinite(sec) || sec < 0) return null;
+    return Math.min(sec * 1000, 5 * 60 * 1000);
+  }
+  const dt = Date.parse(trimmed);
+  if (!Number.isFinite(dt)) return null;
+  const ms = dt - Date.now();
+  if (ms <= 0) return 0;
+  return Math.min(ms, 5 * 60 * 1000);
+}
+
+export interface KeyValidation {
+  ok: boolean;
+  /** When ok=true: short human label like "free $0.00 / unlimited" */
+  label?: string;
+  /** When ok=false: the message to display to the user */
+  error?: string;
+}
+
+/**
+ * Validate an OpenRouter key with a tiny GET to /api/v1/key.
+ * Used by the Settings UI's "Проверить ключ" button so users can confirm a
+ * pasted key works before kicking off a long-running translation.
+ */
+export async function validateApiKey(apiKey: string, signal?: AbortSignal): Promise<KeyValidation> {
+  if (!apiKey || !apiKey.trim()) return { ok: false, error: "пустой ключ" };
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/key", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": typeof window !== "undefined" ? window.location.origin : "",
+        "X-Title": "MIET Translator",
+      },
+      signal,
+    });
+    const text = await res.text().catch(() => "");
+    if (res.status === 401) return { ok: false, error: "ключ недействителен (401). Создай новый на openrouter.ai/keys" };
+    if (res.status === 403) return { ok: false, error: "ключ заблокирован (403)" };
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}: ${text.slice(0, 120)}` };
+    let data: unknown;
+    try { data = JSON.parse(text); } catch { return { ok: true, label: "ключ принят" }; }
+    const d = data as { data?: { label?: string; usage?: number; limit?: number | null; is_free_tier?: boolean } };
+    const info = d?.data ?? {};
+    const tier = info.is_free_tier ? "free" : "paid";
+    const used = typeof info.usage === "number" ? `$${info.usage.toFixed(2)}` : "?";
+    const limit = info.limit == null ? "∞" : `$${Number(info.limit).toFixed(2)}`;
+    return { ok: true, label: `${tier} · потрачено ${used} / лимит ${limit}` };
+  } catch (e) {
+    if ((e as { name?: string })?.name === "AbortError") return { ok: false, error: "отменено" };
+    return { ok: false, error: (e as Error).message || "сеть недоступна" };
+  }
 }
