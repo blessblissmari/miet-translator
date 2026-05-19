@@ -1,5 +1,8 @@
 import { chat, parseJsonLoose } from "./openrouter";
 import { normalizeMath } from "./mathNormalize";
+import { downsampleDataUrl } from "./imageOps";
+import { mapWithConcurrency } from "./concurrency";
+import { harvestPairs, glossaryPrompt, mergeGlossary, type Glossary } from "./glossary";
 import type { SlidePlan, DocPlan, DocBlock, ExtractedDoc } from "./types";
 
 export interface PlannerOpts {
@@ -9,6 +12,9 @@ export interface PlannerOpts {
   onLog?: (msg: string) => void;
   onProgress?: (done: number, total: number) => void;
   signal?: AbortSignal;
+  /** How many pages to translate in parallel. Default 3. Free OpenRouter models
+   *  rate-limit aggressively, so don't push this above 4. */
+  concurrency?: number;
 }
 
 const TARGET_LANG = "Russian";
@@ -76,6 +82,7 @@ STRUCTURE rules:
 async function translateDocPage(
   page: { text: string; imageDataUrl: string; index: number; images?: { dataUrl: string; y: number; w: number; h: number }[] },
   opts: PlannerOpts,
+  glossary?: Glossary,
 ): Promise<DocBlock[]> {
   const isHandwritten = page.text.replace(/\s+/g, "").length < 30;
 
@@ -85,18 +92,24 @@ async function translateDocPage(
     );
   }
 
-  const sysPrompt = isHandwritten
+  const sysPrompt = (isHandwritten
     ? VISION_OCR_PROMPT(TARGET_LANG)
-    : DOC_TRANSLATE_PROMPT(TARGET_LANG);
+    : DOC_TRANSLATE_PROMPT(TARGET_LANG))
+    + (glossary && glossary.size ? glossaryPrompt(glossary) : "");
+
+  // Downsample any image we're about to send (saves 5–20× on bandwidth + tokens).
+  const visionUrl = (isHandwritten || (opts.visionCapable && page.imageDataUrl))
+    ? await downsampleDataUrl(page.imageDataUrl, { maxDim: isHandwritten ? 1800 : 1400 })
+    : "";
 
   const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = isHandwritten
     ? [
         { type: "text", text: `Page ${page.index + 1}. The page may contain handwriting, sketches, or scanned printed text. Carefully transcribe everything you can see, then translate to ${TARGET_LANG} as Markdown per the rules.` },
-        { type: "image_url", image_url: { url: page.imageDataUrl } },
+        { type: "image_url", image_url: { url: visionUrl } },
       ]
     : [
         { type: "text", text: `Translate the following page (page ${page.index + 1}) into ${TARGET_LANG}. Use Markdown as instructed.\n\n${page.text.slice(0, 12000)}` },
-        ...(opts.visionCapable && page.imageDataUrl ? [{ type: "image_url" as const, image_url: { url: page.imageDataUrl } }] : []),
+        ...(opts.visionCapable && visionUrl ? [{ type: "image_url" as const, image_url: { url: visionUrl } }] : []),
       ];
 
   if (isHandwritten) opts.onLog?.(`Стр. ${page.index + 1}: режим vision-OCR (рукопись/скан)`);
@@ -131,13 +144,39 @@ CRITICAL rules:
 `;
 
 export async function planSlides(extracted: ExtractedDoc, opts: PlannerOpts): Promise<SlidePlan[]> {
+  let done = 0;
+  const total = extracted.pages.length;
+  const results = await mapWithConcurrency(
+    extracted.pages,
+    Math.max(1, opts.concurrency ?? 3),
+    async (page, i) => {
+      const plan = await planSlideRobust(page, opts);
+      done++;
+      opts.onProgress?.(done, total);
+      opts.onLog?.(`Слайд ${i + 1}/${total} переведён`);
+      return plan;
+    },
+    { signal: opts.signal },
+  );
+
   const plans: SlidePlan[] = [];
-  for (let i = 0; i < extracted.pages.length; i++) {
-    const page = extracted.pages[i];
-    opts.onLog?.(`Перевод слайда ${i + 1}/${extracted.pages.length}…`);
-    const plan = await planSlideRobust(page, opts);
-    plans.push(plan);
-    opts.onProgress?.(i + 1, extracted.pages.length);
+  const errors: string[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.ok) {
+      plans.push(r.value);
+    } else {
+      errors.push(`Слайд ${i + 1}: ${r.error.message}`);
+      // Insert a placeholder slide so the deck size matches the source.
+      plans.push({
+        title: `Слайд ${i + 1}`,
+        bullets: [`⚠ Не удалось перевести: ${r.error.message}`],
+        layout: "title-text",
+      });
+    }
+  }
+  if (errors.length === plans.length) {
+    throw new Error(`Перевод не удался ни на одном слайде: ${errors[0]}`);
   }
   return plans;
 }
@@ -162,6 +201,7 @@ async function planSlideRobust(
   if (isHandwritten) {
     opts.onLog?.(`Слайд ${page.index + 1}: режим vision-OCR`);
     // For handwritten slides, get a translation directly from the image.
+    const visionUrl = await downsampleDataUrl(page.imageDataUrl, { maxDim: 1800 });
     const out = await chat({
       apiKey: opts.apiKey,
       model: opts.model,
@@ -172,7 +212,7 @@ async function planSlideRobust(
         { role: "system", content: `Read the attached slide image (may be handwritten or scanned), then output a short ${TARGET_LANG} title on the first line, then up to 8 bullet lines starting with "- ". Keep math in $...$ or $$...$$. Output only Markdown.` },
         { role: "user", content: [
           { type: "text", text: `Slide ${page.index + 1} — read & translate.` },
-          { type: "image_url", image_url: { url: page.imageDataUrl } },
+          { type: "image_url", image_url: { url: visionUrl } },
         ] },
       ],
     });
@@ -184,7 +224,10 @@ async function planSlideRobust(
     const userContent: Array<{ type: "text"; text: string } | { type: "image_url"; image_url: { url: string } }> = [
       { type: "text", text: `Slide raw text:\n\n${page.text.slice(0, 6000)}\n\nThis slide has ${realImages.length} embedded figure(s).` },
     ];
-    if (opts.visionCapable) userContent.push({ type: "image_url", image_url: { url: page.imageDataUrl } });
+    if (opts.visionCapable) {
+      const visionUrl = await downsampleDataUrl(page.imageDataUrl, { maxDim: 1400 });
+      userContent.push({ type: "image_url", image_url: { url: visionUrl } });
+    }
     const out = await chat({
       apiKey: opts.apiKey,
       model: opts.model,
@@ -254,52 +297,79 @@ export async function planDoc(extracted: ExtractedDoc, opts: PlannerOpts): Promi
   const allBlocks: DocBlock[] = [];
   let title: string | undefined;
   const errors: string[] = [];
+  const glossary: Glossary = new Map();
+
+  let done = 0;
+  const total = extracted.pages.length;
+  // Per-page mined pairs, populated as workers finish; merged into the shared
+  // glossary between batches so subsequent pages see consistent terminology.
+  const pagePairs: Array<Array<[string, string]>> = new Array(total).fill([]);
+
+  const results = await mapWithConcurrency(
+    extracted.pages,
+    Math.max(1, opts.concurrency ?? 3),
+    async (page, i) => {
+      const blocks = await translateDocPage(page, opts, glossary);
+      done++;
+      opts.onProgress?.(done, total);
+      opts.onLog?.(`Стр. ${i + 1}/${total} переведена`);
+      const tt = blocks.map(b =>
+        b.type === "para" || b.type === "h1" || b.type === "h2" || b.type === "h3"
+          ? b.text
+          : b.type === "list"
+            ? b.items.join(" ")
+            : ""
+      ).join("\n");
+      pagePairs[i] = harvestPairs(page.text, tt);
+      return blocks;
+    },
+    {
+      signal: opts.signal,
+      onBatchSettled: (start, end) => {
+        for (let i = start; i <= end; i++) mergeGlossary(glossary, pagePairs[i]);
+        if (glossary.size > 0) opts.onLog?.(`Глоссарий: ${glossary.size} терминов`);
+      },
+    },
+  );
 
   for (let i = 0; i < extracted.pages.length; i++) {
     const page = extracted.pages[i];
-    opts.onLog?.(`Перевод страницы ${i + 1}/${extracted.pages.length}…`);
-    try {
-      const blocks = await translateDocPage(page, opts);
-      // Lift first h1 into title if doc has none yet
+    const r = results[i];
+    if (r.ok) {
+      const blocks = r.value;
       if (!title && blocks.length > 0 && blocks[0].type === "h1") {
         const h1 = blocks.shift() as DocBlock;
         if (h1.type === "h1") title = h1.text;
       }
       if (blocks.length === 0) {
-        // LLM returned empty — keep page raw text
         if (page.text.trim()) allBlocks.push({ type: "para", text: page.text.trim() });
       } else {
         allBlocks.push(...blocks);
       }
-      // Append extracted images (real figures from the PDF) at the end of the page block group.
-      // Skip whole-page-sized rasters: those are scans of the page, not real figures.
-      const pageW = page.width || 1;
-      const pageH = page.height || 1;
-      const realFigs = (page.images || []).filter(im => {
-        const coverage = (im.w * im.h) / (pageW * pageH);
-        return coverage > 0 && coverage < 0.7;
-      });
-      for (let k = 0; k < realFigs.length; k++) {
-        allBlocks.push({
-          type: "figure",
-          imageDataUrl: realFigs[k].dataUrl,
-          caption: realFigs.length === 1
-            ? `Рис. ${i + 1}`
-            : `Рис. ${i + 1}.${k + 1}`,
-        });
-      }
-    } catch (e) {
-      const msg = (e as Error).message;
+    } else {
+      const msg = r.error.message;
       errors.push(`Страница ${i + 1}: ${msg}`);
       opts.onLog?.(`Ошибка на странице ${i + 1}: ${msg.slice(0, 120)}`);
-      // No image fallback — just put a clear marker so the user can re-run
       allBlocks.push({
         type: "para",
         text: `⚠ Страница ${i + 1}: не удалось перевести (${msg}). Исходный текст ниже.`,
       });
       if (page.text.trim()) allBlocks.push({ type: "para", text: page.text.trim() });
     }
-    opts.onProgress?.(i + 1, extracted.pages.length);
+
+    const pageW = page.width || 1;
+    const pageH = page.height || 1;
+    const realFigs = (page.images || []).filter(im => {
+      const coverage = (im.w * im.h) / (pageW * pageH);
+      return coverage > 0 && coverage < 0.7;
+    });
+    for (let k = 0; k < realFigs.length; k++) {
+      allBlocks.push({
+        type: "figure",
+        imageDataUrl: realFigs[k].dataUrl,
+        caption: realFigs.length === 1 ? `Рис. ${i + 1}` : `Рис. ${i + 1}.${k + 1}`,
+      });
+    }
   }
 
   if (errors.length === extracted.pages.length) {

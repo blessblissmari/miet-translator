@@ -17,8 +17,9 @@ declare module "temml" {
     strict?: boolean;
     [k: string]: unknown;
   }
-  function renderToString(latex: string, options?: TemmlOptions): string;
-  const _default: { renderToString: typeof renderToString };
+  const _default: {
+    renderToString(latex: string, options?: TemmlOptions): string;
+  };
   export default _default;
 }
 
@@ -34,6 +35,11 @@ declare module "libarchive.js" {
 declare module "mammoth/mammoth.browser.js" {
   export function extractRawText(opts: { arrayBuffer: ArrayBuffer }): Promise<{ value: string; messages: unknown[] }>;
   export function convertToHtml(opts: { arrayBuffer: ArrayBuffer }): Promise<{ value: string; messages: unknown[] }>;
-  const _default: { extractRawText: typeof extractRawText; convertToHtml: typeof convertToHtml };
+  export function convertToMarkdown(opts: { arrayBuffer: ArrayBuffer }): Promise<{ value: string; messages: unknown[] }>;
+  const _default: {
+    extractRawText: typeof extractRawText;
+    convertToHtml: typeof convertToHtml;
+    convertToMarkdown: typeof convertToMarkdown;
+  };
   export default _default;
 }

@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import JSZip from "jszip";
 import { saveAs } from "file-saver";
 import { planSlides, planDoc } from "./lib/planner";
 import { buildPptx } from "./lib/pptxBuild";
 import { buildDocx } from "./lib/docxBuild";
-import { FREE_MODELS, DEFAULT_MODEL, DEFAULT_API_KEY } from "./lib/openrouter";
+import { FREE_MODELS, DEFAULT_MODEL, DEFAULT_API_KEY, validateApiKey } from "./lib/openrouter";
 import { expandInputs, type IntakeFile } from "./lib/intake";
 import { extractAny, suggestKind } from "./lib/extractAny";
 import { PdfPreview, SlidesPreview, DocPreview } from "./components/Preview";
@@ -27,6 +27,10 @@ interface QueueItem {
   doc?: DocPlan;
   resultBlob?: Blob;
   resultName?: string;
+  /** ms timestamp when this item entered an active status (extracting/translating/building) */
+  startedAt?: number;
+  /** elapsed time in ms after the item finished (success or error) */
+  elapsedMs?: number;
 }
 
 interface UnsortedItem extends IntakeFile { id: string }
@@ -47,6 +51,14 @@ export default function App() {
   const hasKey = !!apiKey;
   const [model, setModel] = useLocalStorage<string>("openrouter_model", DEFAULT_MODEL);
   const [showSettings, setShowSettings] = useState(!apiKey);
+  const [keyCheck, setKeyCheck] = useState<{ status: "idle" | "checking" | "ok" | "fail"; msg?: string }>({ status: "idle" });
+
+  async function handleCheckKey() {
+    if (!apiKey) { setKeyCheck({ status: "fail", msg: "пустой ключ" }); return; }
+    setKeyCheck({ status: "checking" });
+    const r = await validateApiKey(apiKey);
+    setKeyCheck(r.ok ? { status: "ok", msg: r.label } : { status: "fail", msg: r.error });
+  }
 
   const [unsorted, setUnsorted] = useState<UnsortedItem[]>([]);
   const [items, setItems] = useState<QueueItem[]>([]);
@@ -108,8 +120,9 @@ export default function App() {
 
   async function processItem(it: QueueItem) {
     const signal = abortRef.current?.signal;
+    const startedAt = Date.now();
     try {
-      updateItem(it.id, { status: "extracting", message: "Извлечение содержимого…", progress: null });
+      updateItem(it.id, { status: "extracting", message: "Извлечение содержимого…", progress: null, startedAt, elapsedMs: undefined, error: undefined });
       const extracted = await extractAny(it.blob, it.path.split("/").pop() || it.path,
         (p, t) => updateItem(it.id, { progress: { done: p, total: t } }));
       if (signal?.aborted) throw new Error("aborted");
@@ -132,22 +145,33 @@ export default function App() {
         updateItem(it.id, { status: "building", message: "Сборка PPTX…", slides });
         const blob = await buildPptx(slides);
         const name = (it.path.replace(/\.[^./]+$/, "").split("/").pop() || "result") + "_MIET_ru.pptx";
-        updateItem(it.id, { status: "done", message: `Готово: ${name}`, resultBlob: blob, resultName: name, progress: null });
+        updateItem(it.id, {
+          status: "done", message: `Готово: ${name}`,
+          resultBlob: blob, resultName: name, progress: null,
+          elapsedMs: Date.now() - startedAt,
+        });
       } else {
         const doc = await planDoc(extracted, opts);
         if (signal?.aborted) throw new Error("aborted");
         updateItem(it.id, { status: "building", message: "Сборка DOCX…", doc });
         const blob = await buildDocx(doc);
         const name = (it.path.replace(/\.[^./]+$/, "").split("/").pop() || "result") + "_ru.docx";
-        updateItem(it.id, { status: "done", message: `Готово: ${name}`, resultBlob: blob, resultName: name, progress: null });
+        updateItem(it.id, {
+          status: "done", message: `Готово: ${name}`,
+          resultBlob: blob, resultName: name, progress: null,
+          elapsedMs: Date.now() - startedAt,
+        });
       }
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === "aborted") {
-        updateItem(it.id, { status: "queued", message: "Отменено", progress: null });
+        updateItem(it.id, { status: "queued", message: "Отменено", progress: null, elapsedMs: undefined });
       } else {
         console.error(e);
-        updateItem(it.id, { status: "error", error: msg, message: `Ошибка: ${msg}`, progress: null });
+        updateItem(it.id, {
+          status: "error", error: msg, message: `Ошибка: ${msg}`,
+          progress: null, elapsedMs: Date.now() - startedAt,
+        });
       }
     }
   }
@@ -196,8 +220,25 @@ export default function App() {
     if (selectedId === id) setSelectedId(null);
   }
 
+  function retryItem(id: string) {
+    setItems(prev => prev.map(it => it.id === id
+      ? { ...it, status: "queued", error: undefined, message: "В очереди (повторить)", progress: null, elapsedMs: undefined }
+      : it));
+    // If the run loop isn't going, kick it off so the user gets immediate feedback.
+    if (!running) void runAll();
+  }
+
   function changeKind(id: string, kind: Kind) {
     updateItem(id, { kind });
+  }
+
+  function fmtElapsed(ms: number | undefined): string {
+    if (!ms || ms < 0) return "";
+    const s = Math.round(ms / 1000);
+    if (s < 60) return `${s} с`;
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return `${m} мин ${r.toString().padStart(2, "0")} с`;
   }
 
   // Drag-drop on body
@@ -232,6 +273,8 @@ export default function App() {
 
   const selected = items.find(it => it.id === selectedId) || null;
   const totalQueued = items.filter(i => i.status === "queued" || i.status === "error").length;
+  const totalDone = items.filter(i => i.status === "done").length;
+  const totalErrors = items.filter(i => i.status === "error").length;
 
   return (
     <div className="app">
@@ -257,6 +300,13 @@ export default function App() {
               {hasKey ? "Ключ сохранён в браузере (localStorage). Ни на GitHub, ни куда-то ещё он не уходит — только прямо в openrouter.ai."
                      : <>Без ключа перевод работать не будет. Бесплатный ключ можно получить на <a href="https://openrouter.ai/keys" target="_blank" rel="noreferrer">openrouter.ai/keys</a>. Он хранится только в этом браузере.</>}
             </p>
+            <div className="key-check-row">
+              <button className="ghost" onClick={handleCheckKey} disabled={!hasKey || keyCheck.status === "checking"}>
+                {keyCheck.status === "checking" ? "Проверка…" : "Проверить ключ"}
+              </button>
+              {keyCheck.status === "ok" && <span className="key-check-ok">✓ {keyCheck.msg}</span>}
+              {keyCheck.status === "fail" && <span className="key-check-fail">✗ {keyCheck.msg}</span>}
+            </div>
           </div>
           <label>
             Модель{" "}
@@ -292,40 +342,65 @@ export default function App() {
               {running ? "Обработка…" : `Запустить (${totalQueued})`}
             </button>
             {running && <button className="ghost" onClick={cancelAll}>Стоп</button>}
-            <button className="ghost" onClick={downloadAll} disabled={!items.some(i => i.status === "done")}>
-              ⬇ Скачать всё
+            <button className="ghost" onClick={downloadAll} disabled={!items.some(i => i.status === "done")}
+                    title={items.some(i => i.status === "done") ? "" : "Нет готовых файлов"}>
+              ⬇ Скачать всё{totalDone > 0 ? ` (${totalDone})` : ""}
             </button>
             <button className="ghost" onClick={clearAll} disabled={running}>Очистить</button>
           </div>
 
+          {items.length > 0 && (
+            <div className="queue-summary muted small">
+              {totalDone > 0 && <span>✓ {totalDone}</span>}
+              {totalQueued > 0 && <span>· в очереди {totalQueued}</span>}
+              {totalErrors > 0 && <span className="queue-summary-err">· ошибок {totalErrors}</span>}
+            </div>
+          )}
+
           <ul className="queue">
-            {items.map(it => (
-              <li key={it.id}
-                  className={`q-item q-${it.status} ${selectedId === it.id ? "selected" : ""}`}
-                  onClick={() => setSelectedId(it.id)}>
-                <div className="q-top">
-                  <span className="q-name" title={it.path}>{it.path.split("/").pop()}</span>
-                  <select className={`q-kind kind-${it.kind}`} value={it.kind}
-                          onClick={e => e.stopPropagation()}
-                          onChange={e => changeKind(it.id, e.target.value as Kind)}>
-                    <option value="presentation">PPT</option>
-                    <option value="document">DOC</option>
-                  </select>
-                  <button className="q-remove" title="удалить" onClick={e => { e.stopPropagation(); removeItem(it.id); }}>×</button>
-                </div>
-                <div className="q-status">{it.message ?? statusLabel(it.status)}</div>
-                {it.progress && (
-                  <div className="progress small">
-                    <div className="bar" style={{ width: `${(it.progress.done / Math.max(it.progress.total, 1)) * 100}%` }} />
+            {items.map(it => {
+              const pct = it.progress ? Math.round((it.progress.done / Math.max(it.progress.total, 1)) * 100) : 0;
+              const elapsed = it.elapsedMs ? fmtElapsed(it.elapsedMs) : "";
+              return (
+                <li key={it.id}
+                    className={`q-item q-${it.status} ${selectedId === it.id ? "selected" : ""}`}
+                    onClick={() => setSelectedId(it.id)}>
+                  <div className="q-top">
+                    <span className="q-name" title={it.path}>{it.path.split("/").pop()}</span>
+                    <select className={`q-kind kind-${it.kind}`} value={it.kind}
+                            onClick={e => e.stopPropagation()}
+                            onChange={e => changeKind(it.id, e.target.value as Kind)}>
+                      <option value="presentation">PPT</option>
+                      <option value="document">DOC</option>
+                    </select>
+                    <button className="q-remove" title="удалить" onClick={e => { e.stopPropagation(); removeItem(it.id); }}>×</button>
                   </div>
-                )}
-                {it.status === "done" && (
-                  <button className="ghost q-download" onClick={e => { e.stopPropagation(); downloadOne(it); }}>
-                    ⬇ {it.resultName}
-                  </button>
-                )}
-              </li>
-            ))}
+                  <div className="q-status" title={it.error || it.message || ""}>
+                    {it.message ?? statusLabel(it.status)}
+                    {it.progress && it.progress.total > 1 && (
+                      <span className="q-progress-num"> · {it.progress.done}/{it.progress.total}</span>
+                    )}
+                    {elapsed && <span className="q-elapsed"> · {elapsed}</span>}
+                  </div>
+                  {it.progress && (
+                    <div className="progress small" title={`${pct}%`}>
+                      <div className="bar" style={{ width: `${pct}%` }} />
+                    </div>
+                  )}
+                  {it.status === "error" && (
+                    <button className="ghost q-retry" onClick={e => { e.stopPropagation(); retryItem(it.id); }}
+                            disabled={running}>
+                      ↻ Повторить
+                    </button>
+                  )}
+                  {it.status === "done" && (
+                    <button className="ghost q-download" onClick={e => { e.stopPropagation(); downloadOne(it); }}>
+                      ⬇ {it.resultName}
+                    </button>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </aside>
 
@@ -377,12 +452,8 @@ function OriginalPreview({ blob, path }: { blob: Blob; path: string }) {
 }
 
 function ImageOnly({ blob }: { blob: Blob }) {
-  const [url, setUrl] = useState("");
-  useEffect(() => {
-    const u = URL.createObjectURL(blob);
-    setUrl(u);
-    return () => URL.revokeObjectURL(u);
-  }, [blob]);
+  const url = useMemo(() => URL.createObjectURL(blob), [blob]);
+  useEffect(() => () => URL.revokeObjectURL(url), [url]);
   return <div className="preview-pane"><img src={url} alt="" style={{ maxWidth: "100%" }} /></div>;
 }
 
@@ -394,12 +465,10 @@ function RawTextPreview({ blob, path }: { blob: Blob; path: string }) {
       try {
         if (ext === "docx") {
           const m = await import("mammoth/mammoth.browser.js");
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const r = await (m as any).extractRawText({ arrayBuffer: await blob.arrayBuffer() });
+          const r = await m.extractRawText({ arrayBuffer: await blob.arrayBuffer() });
           setText(r.value || "(пусто)");
         } else if (ext === "pptx") {
-          const JSZipMod = (await import("jszip")).default;
-          const zip = await JSZipMod.loadAsync(await blob.arrayBuffer());
+          const zip = await JSZip.loadAsync(await blob.arrayBuffer());
           const slides = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort();
           const out: string[] = [];
           for (let i = 0; i < slides.length; i++) {

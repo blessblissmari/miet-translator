@@ -90,9 +90,7 @@ function walkTree(node: unknown, prefix: string, out: IntakeFile[]) {
 /** Heuristic: does this PDF look like a presentation (slide deck) or a document? */
 export async function detectKind(blob: Blob): Promise<"presentation" | "document"> {
   // Use pdfjs to read first page dimensions
-  const pdfjsLib = await import("pdfjs-dist");
-  const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-  pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+  const pdfjsLib = await (await import("./pdfjs")).getPdfjs();
 
   const buf = await blob.arrayBuffer();
   const doc = await pdfjsLib.getDocument({ data: buf }).promise;

@@ -290,3 +290,29 @@ select.q-kind.kind-document    { color: #a78bfa; border-color: #a78bfa; }
 .key-row label { display: block; }
 .key-row input { width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px; }
 .key-row a { color: var(--accent); }
+
+
+
+.key-check-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.key-check-ok { color: var(--green); font-size: 12px; }
+.key-check-fail { color: var(--red); font-size: 12px; }
+
+
+
+.queue-summary {
+  padding: 0 14px 8px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+.queue-summary-err { color: var(--red); }
+
+.q-progress-num { color: var(--accent-light); }
+.q-elapsed { color: var(--muted); }
+
+.q-retry {
+  margin-top: 6px; width: 100%;
+  font-size: 12px; color: var(--yellow); border-color: var(--yellow);
+}
+.q-retry:hover { background: rgba(245,158,11,0.1); }

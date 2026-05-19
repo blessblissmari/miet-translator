@@ -2,15 +2,19 @@ import JSZip from "jszip";
 import templateUrl from "../assets/template.pptx?url";
 import type { SlidePlan } from "./types";
 
-// Layout indices in the MIET template
+// Layout indices in the MIET template. Chart layouts (11/12) are intentionally
+// NOT exposed: building real <c:chart/> XML from JSON is significantly more
+// work and the LLM rarely identifies a slide as a chart-only slide reliably.
+// We always serialize the original raster so any chart on the source slide
+// survives as a picture.
 const LAYOUT_INDEX: Record<SlidePlan["layout"], number> = {
   "section-title": 1,           // "Титульный слайд 1"
   "title-text": 4,              // "Заголовок и текст"
   "title-text-image-right": 5,  // "Заголовок, текст и картинка справа"
   "title-text-image-left": 6,   // "Заголовок, текст и картинка слева"
   "title-image": 7,             // "Одна картинка по середине"
-  "title-chart-text": 11,       // "Заголовок, график и текст"
-  "title-chart": 12,            // "Заголовок и график"
+  "title-chart-text": 4,        // unused: alias to title-text
+  "title-chart": 4,             // unused: alias to title-text
 };
 
 // Hard-coded geometries from the layouts (in EMU). Picture placeholders are
@@ -109,7 +113,7 @@ function buildSlideXml(plan: SlidePlan, imageRId: string | null): string {
 
   // Picture
   if (imageRId && geom.picture) {
-    parts.push(picXml(nextId++, imageRId, geom.picture));
+    parts.push(picXml(nextId, imageRId, geom.picture));
   }
 
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>${parts.join("")}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>`;

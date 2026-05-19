@@ -2,21 +2,34 @@ import {
   Document, Packer, Paragraph, HeadingLevel, TextRun, ImageRun, AlignmentType,
   Table, TableRow, TableCell, WidthType, BorderStyle,
 } from "docx";
+import JSZip from "jszip";
 import { latexToOmml } from "./latexOmml";
+import { dataUrlToUint8 as dataUrlToBytes, dataUrlMime } from "./imageOps";
 import type { DocPlan, DocBlock } from "./types";
 
-function dataUrlToUint8(dataUrl: string): Uint8Array {
-  const base64 = dataUrl.split(",")[1];
-  const bin = atob(base64);
-  const arr = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return arr;
+/**
+ * Map a data URL MIME to docx ImageRun's `type` field.
+ * docx@9 supports: "png" | "jpg" | "gif" | "bmp" | "svg". SVG requires a
+ * fallback raster, which we don't have, so we treat any SVG as PNG and let
+ * Word handle the bytes.
+ */
+function imageType(mime: string): "png" | "jpg" | "gif" | "bmp" {
+  if (mime === "image/jpeg" || mime === "image/jpg") return "jpg";
+  if (mime === "image/gif") return "gif";
+  if (mime === "image/bmp") return "bmp";
+  return "png";
 }
 
 async function imageDimensions(dataUrl: string): Promise<{ width: number; height: number }> {
   return new Promise((resolve) => {
     const img = new Image();
-    img.onload = () => resolve({ width: img.width, height: img.height });
+    img.decoding = "async";
+    img.onload = () => {
+      // naturalWidth/Height are the truth; .width can be 0 before layout
+      const w = img.naturalWidth || img.width || 480;
+      const h = img.naturalHeight || img.height || 360;
+      resolve({ width: w, height: h });
+    };
     img.onerror = () => resolve({ width: 480, height: 360 });
     img.src = dataUrl;
   });
@@ -132,8 +145,9 @@ async function blockToElements(block: DocBlock, formulas: FormulaMarker[]): Prom
       })];
     }
     case "figure": {
-      const bytes = dataUrlToUint8(block.imageDataUrl);
+      const bytes = await dataUrlToBytes(block.imageDataUrl);
       const dims = await imageDimensions(block.imageDataUrl);
+      const type = imageType(dataUrlMime(block.imageDataUrl));
       const maxW = 480;
       const scale = dims.width > maxW ? maxW / dims.width : 1;
       const out: Paragraph[] = [
@@ -141,8 +155,8 @@ async function blockToElements(block: DocBlock, formulas: FormulaMarker[]): Prom
           alignment: AlignmentType.CENTER,
           children: [new ImageRun({
             data: bytes,
-            type: "png",
-            transformation: { width: dims.width * scale, height: dims.height * scale },
+            type,
+            transformation: { width: Math.round(dims.width * scale), height: Math.round(dims.height * scale) },
           })],
         }),
       ];
@@ -159,9 +173,11 @@ async function blockToElements(block: DocBlock, formulas: FormulaMarker[]): Prom
 
 /** After docx is packed, replace each text marker `OMMLMARK_xxx` in
  *  word/document.xml with an actual <m:oMath> block.
+ *
+ *  Display formulas: also wrap in <m:oMathPara> so Word centers them.
+ *  Inline formulas:  drop the <m:oMath> in place of the <w:r> placeholder.
  */
 async function injectOmmlIntoDocx(blob: Blob, markers: FormulaMarker[]): Promise<Blob> {
-  const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(await blob.arrayBuffer());
   const docXmlFile = zip.file("word/document.xml");
   if (!docXmlFile) return blob;
@@ -169,11 +185,29 @@ async function injectOmmlIntoDocx(blob: Blob, markers: FormulaMarker[]): Promise
 
   for (const m of markers) {
     const omml = latexToOmml(m.latex, m.display);
-    // Replace the entire <w:r> ... text=ID ... </w:r> block with the oMath element
-    const re = new RegExp(`<w:r\\b[^>]*>(?:(?!</w:r>)[\\s\\S])*?${m.id}[\\s\\S]*?</w:r>`, "g");
-    xml = xml.replace(re, omml);
+    const id = escapeRegex(m.id);
+    // The marker lives inside a <w:r>...<w:t>OMMLMARK_xxx</w:t>...</w:r>.
+    // We use a non-greedy match anchored to the marker text and bounded by the
+    // nearest enclosing </w:r>. (?:(?!</w:r>)[\s\S])*? keeps us inside one run.
+    const runRe = new RegExp(`<w:r\\b(?:(?!</w:r>)[\\s\\S])*?${id}(?:(?!</w:r>)[\\s\\S])*?</w:r>`, "g");
+    const replaced = xml.replace(runRe, omml);
+    if (replaced === xml) {
+      // Marker not found — likely the docx packer collapsed our run differently.
+      // Fall back to plain-text marker replacement so we don't leave OMMLMARK_xxx
+      // visible in the output.
+      xml = xml.replace(new RegExp(id, "g"), escapeXml(m.latex));
+    } else {
+      xml = replaced;
+    }
   }
 
   zip.file("word/document.xml", xml);
   return zip.generateAsync({ type: "blob" });
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function escapeXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }

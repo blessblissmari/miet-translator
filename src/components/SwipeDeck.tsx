@@ -34,16 +34,23 @@ export function SwipeDeck({ items, onDecide, onUndo, onAutoSortAll, onSkip }: Pr
   }
 
   // Keyboard: ← → ↑/↓ Backspace
+  // Use refs so the listener never goes stale without re-binding on every render.
+  const commitRef = useRef(commit);
+  const undoRef = useRef(undo);
+  useEffect(() => {
+    commitRef.current = commit;
+    undoRef.current = undo;
+  });
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === "INPUT") return;
-      if (e.key === "ArrowRight") { e.preventDefault(); commit("presentation"); }
-      else if (e.key === "ArrowLeft") { e.preventDefault(); commit("document"); }
-      else if (e.key === "Backspace" || e.key === "Escape") { e.preventDefault(); undo(); }
+      if (e.key === "ArrowRight") { e.preventDefault(); commitRef.current("presentation"); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); commitRef.current("document"); }
+      else if (e.key === "Backspace" || e.key === "Escape") { e.preventDefault(); undoRef.current(); }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [top, history]);
+  }, []);
 
   return (
     <div className="deck-root">
@@ -161,8 +168,9 @@ function Card({ item, isTop, depth, onDecide, onSkip }: {
 
 function CardThumb({ item }: { item: DeckItem }) {
   const kind = useMemo(() => classifyInput(item.path), [item.path]);
+  // Always create the object URL (hooks order must be stable). Only render <img> if it's actually an image.
+  const url = useObjectUrl(item.blob, kind === "image");
   if (kind === "image") {
-    const url = useObjectUrl(item.blob);
     return <div className="card-thumb image"><img src={url} alt="" /></div>;
   }
   if (kind === "pdf") {
@@ -187,9 +195,7 @@ function PdfThumb({ blob }: { blob: Blob }) {
     let cancelled = false;
     (async () => {
       try {
-        const pdfjsLib = await import("pdfjs-dist");
-        const workerUrl = (await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
-        pdfjsLib.GlobalWorkerOptions.workerSrc = workerUrl;
+        const pdfjsLib = await (await import("../lib/pdfjs")).getPdfjs();
         const buf = await blob.arrayBuffer();
         const doc = await pdfjsLib.getDocument({ data: buf }).promise;
         const page = await doc.getPage(1);
@@ -215,12 +221,11 @@ function PdfThumb({ blob }: { blob: Blob }) {
   </div>;
 }
 
-function useObjectUrl(blob: Blob): string {
-  const [url, setUrl] = useState("");
+function useObjectUrl(blob: Blob, enabled: boolean): string {
+  const url = useMemo(() => (enabled ? URL.createObjectURL(blob) : ""), [blob, enabled]);
   useEffect(() => {
-    const u = URL.createObjectURL(blob);
-    setUrl(u);
-    return () => URL.revokeObjectURL(u);
-  }, [blob]);
+    if (!url) return;
+    return () => URL.revokeObjectURL(url);
+  }, [url]);
   return url;
 }
